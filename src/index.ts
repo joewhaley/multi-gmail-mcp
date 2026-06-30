@@ -26,6 +26,7 @@ import {
   getThread,
   createDraft,
   listDrafts,
+  deleteDraft,
   listLabels,
   createLabel,
   updateLabel,
@@ -272,7 +273,29 @@ export function buildServer(): McpServer {
       withAccount(account, (auth, alias) => listDrafts(auth, alias, { pageSize, pageToken })),
   );
 
-  // --- 5. list_labels ------------------------------------------------------
+  // --- 5. delete_draft -----------------------------------------------------
+  server.registerTool(
+    "delete_draft",
+    {
+      title: "Delete a Gmail draft",
+      description:
+        "Permanently delete a draft email in the selected account, identified by its draftId (e.g. " +
+        "from list_drafts or a create_draft response). This PERMANENTLY removes the draft — it is NOT " +
+        "moved to Trash and cannot be recovered, so confirm the draftId before deleting. Only affects " +
+        "drafts; it never deletes sent or received messages. An unknown draftId returns a not-found error.",
+      inputSchema: {
+        draftId: z
+          .string()
+          .min(1)
+          .describe("The ID of the draft to delete (the draftId from list_drafts or create_draft)."),
+        ...accountField,
+      },
+    },
+    async ({ draftId, account }) =>
+      withAccount(account, (auth, alias) => deleteDraft(auth, alias, { draftId })),
+  );
+
+  // --- 6. list_labels ------------------------------------------------------
   server.registerTool(
     "list_labels",
     {
@@ -298,7 +321,7 @@ export function buildServer(): McpServer {
       withAccount(account, (auth, alias) => listLabels(auth, alias, { pageSize, pageToken })),
   );
 
-  // --- 6. create_label -----------------------------------------------------
+  // --- 7. create_label -----------------------------------------------------
   server.registerTool(
     "create_label",
     {
@@ -320,7 +343,7 @@ export function buildServer(): McpServer {
       withAccount(account, (auth, alias) => createLabel(auth, alias, { name, textColor, backgroundColor })),
   );
 
-  // --- 7. update_label -----------------------------------------------------
+  // --- 8. update_label -----------------------------------------------------
   server.registerTool(
     "update_label",
     {
@@ -343,7 +366,7 @@ export function buildServer(): McpServer {
       ),
   );
 
-  // --- 8. delete_label -----------------------------------------------------
+  // --- 9. delete_label -----------------------------------------------------
   server.registerTool(
     "delete_label",
     {
@@ -361,7 +384,7 @@ export function buildServer(): McpServer {
       withAccount(account, (auth, alias) => deleteLabel(auth, alias, { labelId })),
   );
 
-  // --- 9. label_message ----------------------------------------------------
+  // --- 10. label_message ---------------------------------------------------
   server.registerTool(
     "label_message",
     {
@@ -382,7 +405,7 @@ export function buildServer(): McpServer {
       ),
   );
 
-  // --- 10. unlabel_message -------------------------------------------------
+  // --- 11. unlabel_message -------------------------------------------------
   server.registerTool(
     "unlabel_message",
     {
@@ -403,7 +426,7 @@ export function buildServer(): McpServer {
       ),
   );
 
-  // --- 11. label_thread ----------------------------------------------------
+  // --- 12. label_thread ----------------------------------------------------
   server.registerTool(
     "label_thread",
     {
@@ -424,7 +447,7 @@ export function buildServer(): McpServer {
       ),
   );
 
-  // --- 12. unlabel_thread --------------------------------------------------
+  // --- 13. unlabel_thread --------------------------------------------------
   server.registerTool(
     "unlabel_thread",
     {
@@ -445,7 +468,7 @@ export function buildServer(): McpServer {
       ),
   );
 
-  // --- 13. list_accounts ---------------------------------------------------
+  // --- 14. list_accounts ---------------------------------------------------
   server.registerTool(
     "list_accounts",
     {

@@ -16,6 +16,7 @@ This server **creates drafts only — it never sends email.**
 | `get_thread` | Fetch a thread; `FULL_CONTENT` decodes the plain-text body and lists attachments. |
 | `create_draft` | Build an RFC 2822 draft (text/html/attachments/replies). Never sends. |
 | `list_drafts` | List drafts with subject/to/snippet. |
+| `delete_draft` | Permanently delete a draft by ID (not moved to Trash). |
 | `list_labels` | List user-defined labels (id, name, colors). |
 | `create_label` | Create a label (supports `/` nesting and palette colors). |
 | `update_label` | Rename / recolor a label. |
@@ -226,7 +227,7 @@ Drafts are excluded by default; set `includeTrash: true` to also search Trash/Sp
 ```bash
 npm run build        # compile TypeScript -> dist/
 npm test             # vitest: alias resolution, MIME building, query passthrough
-node scripts/smoke.mjs   # connect over stdio; verify 13 tools + optional `account`
+node scripts/smoke.mjs   # connect over stdio; verify 14 tools + optional `account`
 ```
 
 Source layout:
@@ -244,6 +245,7 @@ Source layout:
 ## Behavior notes & limits
 
 - **Drafts only.** There is no send capability by design.
+- **`delete_draft` is permanent.** It removes the draft outright (not moved to Trash); it never touches sent or received messages.
 - **Bodies** over ~50KB are truncated (flagged); raw attachment bytes are never returned by `get_thread` — only metadata + `attachmentId`.
 - **Attachments** in `create_draft` must total ≤ 25MB; link large files from Drive instead.
 - **Rate limits / 5xx** are retried up to 3 times with exponential backoff; persistent failures return a clear error.
