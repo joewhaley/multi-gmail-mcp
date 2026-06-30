@@ -2,7 +2,7 @@
 /**
  * Connects to the built server over stdio and verifies:
  *   - the server starts and completes the MCP handshake,
- *   - exactly the 13 expected tools are registered,
+ *   - exactly the 14 expected tools are registered,
  *   - every tool's input schema includes an optional `account` parameter.
  *
  * Run: npm run build && node scripts/smoke.mjs
@@ -20,6 +20,7 @@ const EXPECTED = [
   "get_thread",
   "create_draft",
   "list_drafts",
+  "delete_draft",
   "list_labels",
   "create_label",
   "update_label",

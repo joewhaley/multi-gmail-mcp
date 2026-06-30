@@ -540,6 +540,22 @@ export async function listDrafts(
 }
 
 // ---------------------------------------------------------------------------
+// delete_draft
+// ---------------------------------------------------------------------------
+
+export async function deleteDraft(
+  auth: OAuth2Client,
+  alias: string,
+  params: { draftId: string },
+): Promise<{ account: string; deletedDraftId: string }> {
+  const gmail = gmailClient(auth);
+  // drafts.delete permanently removes the draft (it is NOT moved to Trash).
+  // A missing draft surfaces as a 404, which describeGmailError maps cleanly.
+  await withRetry(() => gmail.users.drafts.delete({ userId: "me", id: params.draftId }));
+  return { account: alias, deletedDraftId: params.draftId };
+}
+
+// ---------------------------------------------------------------------------
 // Labels
 // ---------------------------------------------------------------------------
 
