@@ -106,7 +106,25 @@ describe("buildMimeMessage", () => {
     );
     expect(raw).toMatch(/Content-Type: multipart\/related; boundary="B1"/);
     expect(raw).toMatch(/Content-Disposition: inline; filename="logo\.png"/);
-    expect(raw).toMatch(/Content-ID: <logo\.png>/);
+    expect(raw).toMatch(/Content-ID: <att0>/);
+    // cid:<filename> in the HTML is rewritten to the attN Content-ID.
+    const htmlB64 = raw.split('Content-Type: text/html; charset="UTF-8"')[1]!
+      .split("\r\n\r\n")[1]!.split("\r\n--")[0]!.replace(/\r\n/g, "");
+    expect(Buffer.from(htmlB64, "base64").toString("utf8")).toBe('<img src="cid:att0">');
+  });
+
+  it("numbers inline Content-IDs by position across all attachments", () => {
+    const raw = decode(
+      buildMimeMessage({
+        to: ["a@x.com"],
+        htmlBody: '<img src="cid:att1">',
+        attachments: [
+          { filename: "doc.pdf", mimeType: "application/pdf", content: "AAAA" },
+          { filename: "pic.png", mimeType: "image/png", content: "AAAA", inline: true },
+        ],
+      }),
+    );
+    expect(raw).toMatch(/Content-ID: <att1>/);
   });
 
   it("sets reply headers when provided", () => {
@@ -128,8 +146,9 @@ describe("buildMimeMessage", () => {
     expect(raw).toMatch(/Subject: =\?UTF-8\?B\?/);
   });
 
-  it("throws when no recipient is given", () => {
-    expect(() => buildMimeMessage({ to: [], body: "x" })).toThrowError(/recipient/i);
+  it("omits the To header when there are no recipients (drafts allow this)", () => {
+    const raw = decode(buildMimeMessage({ to: [], body: "x" }));
+    expect(raw).not.toMatch(/^To:/m);
   });
 });
 

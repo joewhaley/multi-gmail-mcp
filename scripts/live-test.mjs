@@ -167,6 +167,46 @@ try {
         account: A,
       });
       check(`get_thread MINIMAL [${A}]`, !gtMin.isError, gtMin.text.slice(0, 120));
+      check(
+        `get_thread has viewUrl + messageCount [${A}]`,
+        !!gtFull.json?.viewUrl && gtFull.json?.messageCount === gtFull.json?.messages?.length,
+      );
+
+      // --- get_message (formats + body window) ----------------------------
+      const gm = await call("get_message", { messageId, account: A });
+      check(
+        `get_message PLAIN_TEXT [${A}]`,
+        !gm.isError && gm.json?.message?.id === messageId && typeof gm.json?.message?.body === "string",
+        gm.text.slice(0, 120),
+      );
+      check(`get_message has viewUrl [${A}]`, !!gm.json?.message?.viewUrl);
+      const gmMeta = await call("get_message", { messageId, messageFormat: "METADATA_ONLY", account: A });
+      check(
+        `get_message METADATA_ONLY omits body/subject [${A}]`,
+        !gmMeta.isError && gmMeta.json?.message?.body === undefined && gmMeta.json?.message?.subject === undefined,
+      );
+      const gmRaw = await call("get_message", { messageId, messageFormat: "RAW", account: A });
+      check(`get_message RAW [${A}]`, !gmRaw.isError && /\r?\n\r?\n/.test(gmRaw.json?.message?.raw ?? ""));
+      if (gm.json?.message?.nextBodyOffset !== undefined) {
+        const gm2 = await call("get_message", {
+          messageId,
+          bodyOffset: gm.json.message.nextBodyOffset,
+          account: A,
+        });
+        check(`get_message bodyOffset continues [${A}]`, !gm2.isError && !!gm2.json?.message?.body);
+      }
+
+      // --- search_threads views -------------------------------------------
+      const ids = await call("search_threads", { query: "in:inbox", pageSize: 3, view: "THREAD_VIEW_IDS_ONLY", account: A });
+      check(
+        `search_threads IDS_ONLY [${A}]`,
+        !ids.isError && (ids.json?.threads ?? []).every((t) => t.threadId && !t.messages),
+      );
+      const sum = await call("search_threads", { query: "in:inbox", pageSize: 3, view: "THREAD_VIEW_SUMMARY", account: A });
+      check(
+        `search_threads SUMMARY (<=1 msg/thread) [${A}]`,
+        !sum.isError && (sum.json?.threads ?? []).every((t) => (t.messages?.length ?? 0) <= 1),
+      );
 
       if (!READ_ONLY) {
         // --- label lifecycle (create -> use -> rename -> delete) ----------
@@ -223,6 +263,30 @@ try {
             um.text.slice(0, 120),
           );
 
+          // --- update_message_labels (atomic add + remove) ----------------
+          const uml = await call("update_message_labels", {
+            messageId,
+            addLabelIds: [labelId],
+            account: A,
+          });
+          check(
+            `update_message_labels add [${A}]`,
+            !uml.isError && (uml.json?.labelIds ?? []).includes(labelId),
+            uml.text.slice(0, 120),
+          );
+          const umr = await call("update_message_labels", {
+            messageId,
+            removeLabelIds: [labelId],
+            account: A,
+          });
+          check(
+            `update_message_labels remove [${A}]`,
+            !umr.isError && !(umr.json?.labelIds ?? []).includes(labelId),
+            umr.text.slice(0, 120),
+          );
+          const umNone = await call("update_message_labels", { messageId, account: A });
+          check(`update_message_labels requires a change [${A}]`, umNone.isError);
+
           // --- update_label ------------------------------------------------
           const upd = await call("update_label", {
             labelId,
@@ -267,6 +331,24 @@ try {
         const present = (ldAfter.json?.drafts ?? []).some((d) => d.draftId === draftId);
         check(`draft appears in list_drafts [${A}]`, present, `before=${draftsBefore}`);
 
+        // --- get_draft + list_drafts query/view ---------------------------
+        const gd = await call("get_draft", { draftId, account: A });
+        check(
+          `get_draft [${A}]`,
+          !gd.isError && (gd.json?.message?.body ?? "").includes("Automated test draft"),
+          gd.text.slice(0, 120),
+        );
+        const ldq = await call("list_drafts", {
+          query: "subject:\"multi-gmail-mcp test\"",
+          view: "DRAFT_VIEW_FULL",
+          account: A,
+        });
+        check(
+          `list_drafts query + DRAFT_VIEW_FULL [${A}]`,
+          !ldq.isError &&
+            (ldq.json?.drafts ?? []).some((d) => d.draftId === draftId && typeof d.body === "string"),
+        );
+
         // --- delete_draft (cleanup + round-trip test) --------------------
         const dd = await call("delete_draft", { draftId, account: A });
         check(`delete_draft [${A}]`, !dd.isError, dd.text.slice(0, 120));
@@ -277,6 +359,38 @@ try {
           const ldGone = await call("list_drafts", { account: A });
           const stillThere = (ldGone.json?.drafts ?? []).some((d) => d.draftId === draftId);
           check(`draft gone from list_drafts after delete [${A}]`, !stillThere);
+        }
+      }
+
+      // --- reply draft: auto-threading + quoting (to self, then deleted) ---
+      const replyTo = sampleThreadByAlias[A] ? (await call("get_thread", {
+        threadId: sampleThreadByAlias[A], messageFormat: "MINIMAL", account: A,
+      })).json?.messages?.[0]?.id : undefined;
+      if (replyTo) {
+        const rd = await call("create_draft", {
+          to: [acct.email],
+          body: "Automated reply test. Safe to delete.",
+          replyToMessageId: replyTo,
+          account: A,
+        });
+        const rdId = rd.json?.draftId;
+        check(`create_draft reply [${A}]`, !rd.isError && !!rdId && !!rd.json?.viewUrl, rd.text.slice(0, 120));
+        if (rdId) {
+          const rg = await call("get_draft", { draftId: rdId, account: A });
+          const body = rg.json?.message?.body ?? "";
+          check(`reply draft quotes original [${A}]`, /wrote:\n>/.test(body), body.slice(0, 120));
+          check(`reply draft inherits Re: subject [${A}]`, /^re:/i.test(rg.json?.message?.subject ?? ""));
+
+          // trash/untrash round trip on our own test draft message only.
+          const mid = rd.json?.messageId;
+          if (mid) {
+            const tm = await call("trash_message", { messageId: mid, account: A });
+            check(`trash_message (test draft) [${A}]`, !tm.isError && (tm.json?.labelIds ?? []).includes("TRASH"), tm.text.slice(0, 120));
+            const um = await call("untrash_message", { messageId: mid, account: A });
+            check(`untrash_message (test draft) [${A}]`, !um.isError && !(um.json?.labelIds ?? []).includes("TRASH"), um.text.slice(0, 120));
+          }
+          const rdd = await call("delete_draft", { draftId: rdId, account: A });
+          if (rdd.isError) createdDrafts.push({ alias: A, email: acct.email, draftId: rdId });
         }
       }
     }

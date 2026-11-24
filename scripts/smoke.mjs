@@ -2,7 +2,7 @@
 /**
  * Connects to the built server over stdio and verifies:
  *   - the server starts and completes the MCP handshake,
- *   - exactly the 14 expected tools are registered,
+ *   - exactly the expected tools are registered,
  *   - every tool's input schema includes an optional `account` parameter.
  *
  * Run: npm run build && node scripts/smoke.mjs
@@ -30,6 +30,19 @@ const EXPECTED = [
   "label_thread",
   "unlabel_thread",
   "list_accounts",
+  "get_message",
+  "get_draft",
+  "update_message_labels",
+  "trash_message",
+  "trash_thread",
+  "untrash_message",
+  "untrash_thread",
+  "mark_message_spam",
+  "mark_thread_spam",
+  "unmark_message_spam",
+  "unmark_thread_spam",
+  "apply_sensitive_message_label",
+  "apply_sensitive_thread_label",
 ];
 
 function fail(msg) {
