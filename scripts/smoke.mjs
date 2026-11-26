@@ -31,6 +31,7 @@ const EXPECTED = [
   "unlabel_thread",
   "list_accounts",
   "get_message",
+  "download_gmail_attachment",
   "get_draft",
   "update_message_labels",
   "trash_message",
