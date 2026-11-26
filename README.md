@@ -18,10 +18,11 @@ This server **creates drafts only — it never sends email.**
 | `create_draft` | Build a draft (text/html/attachments). Replies auto-thread, quote the original, and default `to` to the sender. Optional `includeSignature`. Never sends. |
 | `list_drafts` | List drafts, optionally filtered by `query`; `DRAFT_VIEW_FULL` adds bodies. |
 | `get_draft` | Fetch one draft in any message format. |
+| `update_draft` | Edit a draft with merge semantics (omitted fields kept; attachments are replaced, not merged). |
 | `delete_draft` | Permanently delete a draft by ID (not moved to Trash). |
-| `list_labels` | List system + user labels (id, name, type, colors). |
-| `create_label` / `update_label` / `delete_label` | Create, rename/recolor, delete user labels. |
-| `label_message` / `unlabel_message` | Add/remove labels on a message. |
+| `list_labels` | List system + user labels (id, name, type, colors, visibility). |
+| `create_label` / `update_label` / `delete_label` | Create (auto-creating parents for `A/B/C`), rename/recolor (`colorPreset`), set visibility, delete user labels. |
+| `label_message` / `unlabel_message` | Add/remove labels on a message (`SPAM` can only be removed via `unmark_*_spam`). |
 | `update_message_labels` | Add and remove message labels atomically in one call. |
 | `label_thread` / `unlabel_thread` | Add/remove labels on a whole thread. |
 | `trash_message` / `trash_thread` | Move to Trash (recoverable). |
@@ -31,7 +32,13 @@ This server **creates drafts only — it never sends email.**
 | `apply_sensitive_message_label` / `apply_sensitive_thread_label` | Connector-compatible TRASH/SPAM aliases. |
 | `list_accounts` | List configured accounts with email, default flag, and auth status. |
 
-Results include a `viewUrl` that opens the message, thread, or draft in Gmail on the web (for the right account).
+Results use the connector's field names — `sender`, `toRecipients` / `ccRecipients` /
+`bccRecipients` (plain addresses), `addressDisplayNames` (`[{emailAddress, displayName}]`),
+`date` (ISO-8601 UTC), `historyId`, `plaintextBody` (`\n` line endings), `htmlBody`,
+`attachmentIds`, `attachments` — and include a `viewUrl`
+(`#all/thread-f:<id>|msg-f:<id>`) that opens the thread/message in Gmail on the web for the
+right account. Snippets are HTML-entity-decoded (the connector returns them escaped). Threads and drafts expose their
+ID as both `id` and `threadId` / `draftId`.
 
 Every tool above (including `list_accounts`) accepts an optional **`account`** parameter.
 
@@ -238,8 +245,9 @@ Drafts are excluded by default; set `includeTrash: true` to also search Trash/Sp
 
 ```bash
 npm run build        # compile TypeScript -> dist/
-npm test             # vitest: alias resolution, MIME, query building, body decoding
+npm test             # vitest: alias resolution, MIME, query building, body decoding, retry
 node scripts/live-test.mjs   # end-to-end against your real accounts (cleans up after itself)
+node scripts/edge-test.mjs [account]   # hand-built MIME edge cases via drafts (cleaned up)
 node scripts/smoke.mjs   # connect over stdio; verify all tools + optional `account`
 ```
 
@@ -265,7 +273,8 @@ Source layout:
 - **Attachments**: metadata only (filename, mimeType, size, attachmentId, Content-ID); raw bytes are never returned.
 - **Inline images** in `create_draft`: reference them as `cid:attN` (N = position in `attachments`); `cid:<filename>` still works.
 - **Attachments** in `create_draft` must total ≤ 25MB; link large files from Drive instead.
-- **Rate limits / 5xx** are retried up to 3 times with exponential backoff; persistent failures return a clear error.
+- **Rate limits** (Gmail's per-user, per-minute quota) are retried up to 6 times with exponential backoff (≈1s→16s, honoring `Retry-After`); **5xx** errors up to 3 times. Persistent failures return a clear error.
+- **Attached emails** (`message/rfc822`, e.g. "forward as attachment") are listed as attachments; their text is not merged into the outer body.
 - **Auth errors** (`401` / `invalid_grant`) tell you exactly which account to re-auth.
 - **System labels** (`INBOX`, `STARRED`, `UNREAD`, `IMPORTANT`, `CATEGORY_*`, ...) are listed by `list_labels` and usable by ID; they cannot be deleted or renamed. `DRAFT` and `SENT` are read-only.
 - **Trash vs. delete:** `trash_*` is recoverable for 30 days; only `delete_draft` deletes permanently.

@@ -165,3 +165,48 @@ describe("format normalization", () => {
     expect(normalizeThreadView("THREAD_VIEW_SUMMARY")).toBe("SUMMARY");
   });
 });
+
+describe("extractContent: attached emails", () => {
+  const gmail = { users: { messages: { attachments: { get: async () => ({ data: {} }) } } } } as any;
+  it("does not merge a forwarded message/rfc822 into the body", async () => {
+    const payload = {
+      mimeType: "multipart/mixed",
+      parts: [
+        { mimeType: "text/plain", body: { data: b64url("Outer.") } },
+        {
+          mimeType: "message/rfc822",
+          filename: "",
+          body: { size: 100 },
+          parts: [{ mimeType: "text/plain", body: { data: b64url("INNER") } }],
+        },
+      ],
+    };
+    const c = await extractContent(gmail, "m", payload);
+    expect(c.plain).toBe("Outer.");
+    expect(c.attachments.map((a) => a.filename)).toEqual(["attached-message.eml"]);
+  });
+});
+
+describe("parseAddressList", () => {
+  it("handles quoted commas, comments, escaped quotes, groups, and bare angles", async () => {
+    const { parseAddressList } = await import("../src/content.js");
+    expect(
+      parseAddressList(
+        '"Doe, Jane" <jane@x.com>, bob@x.com (Bob Smith), undisclosed-recipients:;, ' +
+          '"Q \\"Z\\"" <q@x.com>, <angle@x.com>',
+      ),
+    ).toEqual([
+      { email: "jane@x.com", name: "Doe, Jane" },
+      { email: "bob@x.com", name: "Bob Smith" },
+      { email: "q@x.com", name: 'Q "Z"' },
+      { email: "angle@x.com" },
+    ]);
+  });
+  it("handles named groups with members", async () => {
+    const { parseAddressList } = await import("../src/content.js");
+    expect(parseAddressList("Team: a@x.com, B <b@x.com>;").map((a) => a.email)).toEqual([
+      "a@x.com",
+      "b@x.com",
+    ]);
+  });
+});

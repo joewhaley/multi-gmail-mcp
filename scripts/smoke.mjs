@@ -43,6 +43,7 @@ const EXPECTED = [
   "unmark_thread_spam",
   "apply_sensitive_message_label",
   "apply_sensitive_thread_label",
+  "update_draft",
 ];
 
 function fail(msg) {

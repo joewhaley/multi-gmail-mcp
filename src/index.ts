@@ -40,6 +40,10 @@ import {
   markSpam,
   unmarkSpam,
   applySensitiveLabel,
+  updateDraft,
+  assertNoSpamRemoval,
+  LABEL_COLOR_PRESETS,
+  GmailError,
   describeGmailError,
   type AccountCtx,
 } from "./gmail.js";
@@ -148,6 +152,24 @@ const bodyWindowFields = {
     .optional()
     .describe("Byte offset into htmlBody (FULL_CONTENT only); pass nextHtmlBodyOffset to continue."),
 };
+
+const attachmentsField = z
+  .array(
+    z.object({
+      filename: z.string().optional().describe("File name shown to recipients, e.g. \"invoice.pdf\"."),
+      mimeType: z
+        .string()
+        .optional()
+        .describe("IANA MIME type, e.g. \"application/pdf\". Defaults to application/octet-stream."),
+      content: z.string().describe("Base64-encoded file content."),
+      inline: z
+        .boolean()
+        .optional()
+        .describe("If true, embed inline; reference from htmlBody as cid:attN (N = position in attachments)."),
+    }),
+  )
+  .optional()
+  .describe("Attachments to include; combined size ≤ 25MB.");
 
 const SEARCH_SYNTAX_DOC =
   "The `query` uses full Gmail search syntax. Operators include:\n" +
@@ -329,23 +351,7 @@ export function buildServer(): McpServer {
           .boolean()
           .optional()
           .describe("Append the account's configured Gmail signature. Defaults to false."),
-        attachments: z
-          .array(
-            z.object({
-              filename: z.string().optional().describe("File name shown to recipients, e.g. \"invoice.pdf\"."),
-              mimeType: z
-                .string()
-                .optional()
-                .describe("IANA MIME type, e.g. \"application/pdf\". Defaults to application/octet-stream."),
-              content: z.string().describe("Base64-encoded file content."),
-              inline: z
-                .boolean()
-                .optional()
-                .describe("If true, embed inline; reference from htmlBody as cid:attN (N = position in attachments)."),
-            }),
-          )
-          .optional()
-          .describe("Attachments to include; combined size ≤ 25MB."),
+        attachments: attachmentsField,
         ...accountField,
       },
     },
@@ -400,6 +406,36 @@ export function buildServer(): McpServer {
       withAccount(account, (auth, ctx) =>
         getDraft(auth, ctx, { draftId, messageFormat, bodyOffset, htmlBodyOffset }),
       ),
+  );
+
+  // --- update_draft -------------------------------------------------------
+  server.registerTool(
+    "update_draft",
+    {
+      title: "Update a Gmail draft",
+      description:
+        "Update an existing draft (draftId from list_drafts or create_draft) with merge semantics: " +
+        "non-empty to/cc/bcc/subject replace the current values; omitted or empty ones are kept. If " +
+        "both body and htmlBody are omitted the existing body is kept; giving only `body` makes it a " +
+        "plain-text draft (HTML cleared); giving only `htmlBody` makes it HTML-only (plain text " +
+        "cleared). `body` is plain text — no Markdown.\n\n" +
+        "WARNING: attachments are NOT merged. Existing attachments are removed unless re-provided " +
+        "in `attachments` (the response lists any removedAttachments). Reply threading is kept. " +
+        "Returns id/draftId, messageId, threadId, and viewUrl. Never sends.",
+      inputSchema: {
+        draftId: z.string().min(1).describe("The ID of the draft to update."),
+        to: z.array(z.string()).optional().describe("New primary recipients; omit/empty keeps the existing ones."),
+        cc: z.array(z.string()).optional().describe("New CC recipients; omit/empty keeps the existing ones."),
+        bcc: z.array(z.string()).optional().describe("New BCC recipients; omit/empty keeps the existing ones."),
+        subject: z.string().optional().describe("New subject; omit/empty keeps the existing one."),
+        body: z.string().optional().describe("New plain-text body (no Markdown)."),
+        htmlBody: z.string().optional().describe("New HTML body."),
+        attachments: attachmentsField,
+        ...accountField,
+      },
+    },
+    async ({ account, ...params }) =>
+      withAccount(account, (auth, ctx) => updateDraft(auth, ctx, params)),
   );
 
   // --- delete_draft -------------------------------------------------------
@@ -458,48 +494,95 @@ export function buildServer(): McpServer {
       withAccount(account, (auth, ctx) => listLabels(auth, ctx, { includeSystem, pageSize, pageToken })),
   );
 
-  // --- create_label -------------------------------------------------------
+  // --- create_label / update_label ---------------------------------------
+  const colorPresetField = z
+    .enum([
+      "LABEL_COLOR_PRESET_UNSPECIFIED",
+      ...(Object.keys(LABEL_COLOR_PRESETS) as [string, ...string[]]),
+    ])
+    .optional();
+  const labelListVisibilityField = z
+    .enum(["LABEL_LIST_VISIBILITY_UNSPECIFIED", "LABEL_SHOW", "LABEL_SHOW_IF_UNREAD", "LABEL_HIDE"])
+    .optional();
+  const messageListVisibilityField = z
+    .enum(["MESSAGE_LIST_VISIBILITY_UNSPECIFIED", "SHOW", "HIDE"])
+    .optional();
+  const legacyColorFields = {
+    color: z
+      .object({
+        textColor: z.string().optional(),
+        backgroundColor: z.string().optional(),
+      })
+      .optional()
+      .describe("Deprecated: use colorPreset. Raw text/background hex colors from Gmail's palette."),
+    textColor: z.string().optional().describe("Deprecated: use colorPreset. Raw text color hex."),
+    backgroundColor: z.string().optional().describe("Deprecated: use colorPreset. Raw background color hex."),
+  };
+  const PRESET_DOC =
+    "Color presets: BLACK, DARK_GRAY, GRAY, LIGHT_GRAY, WHITE, RED, ORANGE, YELLOW, GREEN, MINT, " +
+    "TEAL, BLUE, PURPLE, PINK, DARK_RED, DARK_ORANGE, DARK_GREEN, DARK_BLUE, DARK_PURPLE, " +
+    "DARK_PINK, BROWN (as LABEL_COLOR_PRESET_<NAME>).";
+
   server.registerTool(
     "create_label",
     {
       title: "Create a Gmail label",
       description:
-        "Create a new user label in the selected account and return its ID. Supports nesting with " +
-        "forward slashes (e.g. \"Projects/Alpha\"); missing parent labels are created automatically.\n\n" +
-        "Optional textColor and backgroundColor must BOTH be provided together and must be values from " +
-        "Gmail's fixed palette of hex colors (e.g. #ffffff, #000000, #16a766, #4a86e8, #fb4c2f, ...). " +
-        "Invalid colors are rejected with a clear error.",
+        "Create a new user label in the selected account and return it (with its ID). Supports " +
+        "nested labels with forward slashes (e.g. \"Projects/Alpha/Sprint-1\"); missing parent " +
+        "labels are created automatically unless autoCreateParentLabels is false.\n\n" +
+        PRESET_DOC,
       inputSchema: {
-        name: z.string().min(1).describe("Label display name. Use \"/\" for nested sub-labels."),
-        textColor: z.string().optional().describe("Text color hex from Gmail's palette. Requires backgroundColor too."),
-        backgroundColor: z.string().optional().describe("Background color hex from Gmail's palette. Requires textColor too."),
+        displayName: z
+          .string()
+          .optional()
+          .describe("Required. Label display name; use \"/\" for nested sub-labels."),
+        name: z.string().optional().describe("Deprecated alias for displayName."),
+        autoCreateParentLabels: z
+          .boolean()
+          .optional()
+          .describe("Create missing parent labels for nested names. Defaults to true."),
+        colorPreset: colorPresetField.describe("Color preset tile for the label. Omit for default styling."),
+        labelListVisibility: labelListVisibilityField.describe(
+          "Visibility in the label list. Defaults to LABEL_SHOW.",
+        ),
+        messageListVisibility: messageListVisibilityField.describe(
+          "Visibility in the message list. Defaults to SHOW.",
+        ),
+        ...legacyColorFields,
         ...accountField,
       },
     },
-    async ({ name, textColor, backgroundColor, account }) =>
-      withAccount(account, (auth, ctx) => createLabel(auth, ctx, { name, textColor, backgroundColor })),
+    async ({ displayName, name, account, ...style }) =>
+      withAccount(account, (auth, ctx) => {
+        const label = displayName ?? name;
+        if (!label?.trim()) throw new GmailError("displayName is required.");
+        return createLabel(auth, ctx, { displayName: label, ...style });
+      }),
   );
 
-  // --- update_label -------------------------------------------------------
   server.registerTool(
     "update_label",
     {
       title: "Update a Gmail label",
       description:
-        "Rename and/or recolor an existing user label (identified by its label ID, e.g. from " +
-        "list_labels). Provide any of name, textColor, backgroundColor. Colors must come in pairs and " +
-        "use Gmail's allowed palette. System labels cannot be modified.",
+        "Modify an existing user label's name, color, and/or visibility (label ID from " +
+        "list_labels). Omitted fields are left unchanged. System labels cannot be modified.\n\n" +
+        PRESET_DOC,
       inputSchema: {
         labelId: z.string().min(1).describe("The ID of the label to modify (see list_labels)."),
-        name: z.string().optional().describe("New display name."),
-        textColor: z.string().optional().describe("New text color hex (requires backgroundColor)."),
-        backgroundColor: z.string().optional().describe("New background color hex (requires textColor)."),
+        displayName: z.string().optional().describe("New display name."),
+        name: z.string().optional().describe("Deprecated alias for displayName."),
+        colorPreset: colorPresetField.describe("New color preset. Omit to keep the existing color."),
+        labelListVisibility: labelListVisibilityField.describe("New label-list visibility."),
+        messageListVisibility: messageListVisibilityField.describe("New message-list visibility."),
+        ...legacyColorFields,
         ...accountField,
       },
     },
-    async ({ labelId, name, textColor, backgroundColor, account }) =>
+    async ({ labelId, displayName, name, account, ...style }) =>
       withAccount(account, (auth, ctx) =>
-        updateLabel(auth, ctx, { labelId, name, textColor, backgroundColor }),
+        updateLabel(auth, ctx, { labelId, displayName: displayName ?? name, ...style }),
       ),
   );
 
@@ -558,7 +641,8 @@ export function buildServer(): McpServer {
       title: "Remove labels from a message",
       description:
         "Remove one or more labels from a single message (e.g. UNREAD to mark read, INBOX to " +
-        "archive). labelIds must be label IDs, not display names. Find message IDs via get_thread.",
+        "archive, TRASH to restore). labelIds must be label IDs, not display names. SPAM cannot be " +
+        "removed here — use unmark_message_spam. Find message IDs via get_thread.",
       inputSchema: {
         messageId: z.string().min(1).describe("The message ID to unlabel."),
         labelIds: labelIdsField("remove"),
@@ -566,9 +650,10 @@ export function buildServer(): McpServer {
       },
     },
     async ({ messageId, labelIds, account }) =>
-      withAccount(account, (auth, ctx) =>
-        modifyMessageLabels(auth, ctx, { messageId, removeLabelIds: labelIds }),
-      ),
+      withAccount(account, (auth, ctx) => {
+        assertNoSpamRemoval(labelIds, "message");
+        return modifyMessageLabels(auth, ctx, { messageId, removeLabelIds: labelIds });
+      }),
   );
 
   server.registerTool(
@@ -619,8 +704,9 @@ export function buildServer(): McpServer {
     {
       title: "Remove labels from a thread",
       description:
-        "Remove one or more labels from every message in a thread (e.g. INBOX to archive the whole " +
-        "thread). labelIds must be label IDs, not display names. Find thread IDs via search_threads.",
+        "Remove one or more labels from every message in a thread (e.g. UNREAD to mark read, INBOX " +
+        "to archive the whole thread). labelIds must be label IDs, not display names. SPAM cannot " +
+        "be removed here — use unmark_thread_spam. Find thread IDs via search_threads.",
       inputSchema: {
         threadId: z.string().min(1).describe("The thread ID to unlabel."),
         labelIds: labelIdsField("remove"),
@@ -628,9 +714,10 @@ export function buildServer(): McpServer {
       },
     },
     async ({ threadId, labelIds, account }) =>
-      withAccount(account, (auth, ctx) =>
-        modifyThreadLabels(auth, ctx, { threadId, removeLabelIds: labelIds }),
-      ),
+      withAccount(account, (auth, ctx) => {
+        assertNoSpamRemoval(labelIds, "thread");
+        return modifyThreadLabels(auth, ctx, { threadId, removeLabelIds: labelIds });
+      }),
   );
 
   // --- trash / untrash / spam --------------------------------------------

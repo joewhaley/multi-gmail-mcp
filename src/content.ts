@@ -142,3 +142,67 @@ export function quoteHtml(attribution: string, originalHtml: string): string {
 export function plainToHtml(text: string): string {
   return escapeHtml(text).replace(/\r?\n/g, "<br>");
 }
+
+export interface ParsedAddress {
+  email: string;
+  name?: string;
+}
+
+/**
+ * Parse an RFC 5322 address-list header ("A <a@x>, \"Doe, J\" <j@x>, b@y")
+ * into addresses. Commas inside quotes, angle brackets, or comments don't split;
+ * group syntax ("Team: a@x, b@y;", "undisclosed-recipients:;") yields its members.
+ */
+export function parseAddressList(value: string): ParsedAddress[] {
+  const parts: string[] = [];
+  let cur = "";
+  let inQuote = false;
+  let angle = 0;
+  let paren = 0;
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i]!;
+    if (ch === "\\" && inQuote) {
+      cur += ch + (value[i + 1] ?? "");
+      i++;
+      continue;
+    }
+    if (ch === '"' && !angle && !paren) inQuote = !inQuote;
+    else if (!inQuote) {
+      if (ch === "<") angle++;
+      else if (ch === ">" && angle) angle--;
+      else if (ch === "(") paren++;
+      else if (ch === ")" && paren) paren--;
+      else if ((ch === "," || ch === ";") && !angle && !paren) {
+        // ";" ends an RFC 5322 group ("Team: a@x, b@y;").
+        parts.push(cur);
+        cur = "";
+        continue;
+      } else if (ch === ":" && !angle && !paren && !cur.includes("@")) {
+        // Group display name ("undisclosed-recipients:") — not an address.
+        cur = "";
+        continue;
+      }
+    }
+    cur += ch;
+  }
+  parts.push(cur);
+
+  const out: ParsedAddress[] = [];
+  for (const raw of parts) {
+    const part = raw.trim();
+    if (!part) continue;
+    const m = part.match(/^(.*?)<([^>]*)>\s*(\(.*\))?$/);
+    if (m) {
+      const email = m[2]!.trim();
+      if (!email) continue;
+      const name = m[1]!.trim().replace(/^"(.*)"$/, "$1").replace(/\\(.)/g, "$1").trim();
+      out.push(name ? { email, name } : { email });
+    } else {
+      // Bare address, possibly with a trailing "(Comment Name)".
+      const c = part.match(/^(\S+@\S+?)\s*\((.*)\)$/);
+      if (c) out.push(c[2]!.trim() ? { email: c[1]!, name: c[2]!.trim() } : { email: c[1]! });
+      else out.push({ email: part });
+    }
+  }
+  return out;
+}

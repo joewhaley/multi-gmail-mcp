@@ -16,7 +16,15 @@ import {
   assertAttachmentSize,
   type MimeAttachment,
 } from "./mime.js";
-import { htmlToText, sliceUtf8, quotePlain, quoteHtml, plainToHtml } from "./content.js";
+import {
+  htmlToText,
+  sliceUtf8,
+  quotePlain,
+  quoteHtml,
+  plainToHtml,
+  parseAddressList,
+  decodeEntities,
+} from "./content.js";
 
 /** ~50KB window of body text returned per call (continue with bodyOffset). */
 const MAX_BODY_BYTES = 50 * 1024;
@@ -115,23 +123,37 @@ export function describeGmailError(err: any, alias: string): GmailError {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Run `fn`, retrying transient failures up to `attempts` times with backoff. */
-export async function withRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
+/** Seconds from a Retry-After response header, if present. */
+function retryAfterMs(err: any): number | undefined {
+  const headers = err?.response?.headers;
+  const raw = typeof headers?.get === "function" ? headers.get("retry-after") : headers?.["retry-after"];
+  const secs = Number.parseInt(String(raw ?? ""), 10);
+  return Number.isFinite(secs) && secs > 0 ? secs * 1000 : undefined;
+}
+
+/**
+ * Run `fn`, retrying transient failures with exponential backoff + jitter.
+ * Gmail's per-user quota is enforced per minute, so rate-limit errors get a
+ * longer schedule (~1s, 2s, 4s, 8s, 16s; honoring Retry-After) than 5xx errors
+ * (~0.5s, 1s).
+ */
+export async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
   let lastErr: unknown;
-  for (let attempt = 0; attempt < attempts; attempt++) {
+  for (let attempt = 0; ; attempt++) {
     try {
       return await fn();
     } catch (err) {
       lastErr = err;
-      if (attempt < attempts - 1 && isRetryable(err)) {
-        // Exponential backoff with jitter: ~0.5s, 1s, 2s.
-        const delay = 500 * 2 ** attempt + Math.floor(Math.random() * 250);
-        await sleep(delay);
-        continue;
-      }
-      throw err;
+      if (!isRetryable(err)) throw err;
+      const rateLimited = isRateLimit(err);
+      const maxAttempts = rateLimited ? 6 : 3;
+      if (attempt >= maxAttempts - 1) throw lastErr;
+      const base = rateLimited ? 1000 : 500;
+      const delay =
+        retryAfterMs(err) ?? Math.min(base * 2 ** attempt, 16_000) + Math.floor(Math.random() * 250);
+      await sleep(delay);
     }
   }
-  throw lastErr;
 }
 
 /** Run async tasks with bounded concurrency, preserving input order. */
@@ -194,14 +216,37 @@ export interface AccountCtx {
   email: string;
 }
 
-/** Gmail web URL for a message or thread ID in a specific account. */
-export function viewUrl(email: string, id: string): string {
-  return `https://mail.google.com/mail/?authuser=${encodeURIComponent(email)}#all/${id}`;
+/** Gmail API hex ID -> the decimal form Gmail web uses (thread-f:/msg-f:). */
+function hexToDecimal(id: string): string | undefined {
+  return /^[0-9a-f]{1,16}$/i.test(id) ? BigInt(`0x${id}`).toString(10) : undefined;
+}
+
+function webBase(email: string): string {
+  return `https://mail.google.com/mail/?authuser=${email}`;
+}
+
+/**
+ * Gmail web URL for a thread, or for a specific message in it, matching the
+ * connector's form: #all/thread-f:<dec>[|msg-f:<dec>].
+ */
+export function viewUrl(email: string, threadId: string, messageId?: string): string {
+  const t = hexToDecimal(threadId);
+  if (!t) return `${webBase(email)}#all/${threadId}`;
+  const m = messageId ? hexToDecimal(messageId) : undefined;
+  return `${webBase(email)}#all/thread-f:${t}${m ? `|msg-f:${m}` : ""}`;
 }
 
 /** Gmail web URL that opens a draft (by its message ID) in the composer. */
 export function draftViewUrl(email: string, messageId: string): string {
-  return `https://mail.google.com/mail/?authuser=${encodeURIComponent(email)}#drafts?compose=${messageId}`;
+  return `${webBase(email)}#drafts?compose=${messageId}`;
+}
+
+/** ISO-8601 UTC timestamp (second precision) from internalDate, else the Date header. */
+function isoDate(internalDate?: string | null, dateHeader?: string): string | undefined {
+  const ms = internalDate ? Number(internalDate) : Number.NaN;
+  const d = Number.isFinite(ms) ? new Date(ms) : dateHeader ? new Date(dateHeader) : undefined;
+  if (!d || Number.isNaN(d.getTime())) return dateHeader || undefined;
+  return d.toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +284,8 @@ function isAttachmentPart(part: gmail_v1.Schema$MessagePart): boolean {
   const mimeType = (part.mimeType ?? "").toLowerCase();
   if (mimeType.startsWith("multipart/")) return false;
   if (part.filename) return true;
+  // An attached/forwarded email is a file even without a filename.
+  if (mimeType === "message/rfc822") return true;
   const disposition = header(part.headers ?? undefined, "Content-Disposition").toLowerCase();
   if (disposition.startsWith("attachment")) return true;
   // Non-text parts stored out-of-line (e.g. unnamed inline images).
@@ -267,7 +314,9 @@ export async function extractContent(
 
     if (isAttachmentPart(part)) {
       const meta: AttachmentMeta = {
-        filename: part.filename || "(unnamed)",
+        filename:
+          part.filename ||
+          ((part.mimeType ?? "").toLowerCase() === "message/rfc822" ? "attached-message.eml" : "(unnamed)"),
         mimeType: part.mimeType || "application/octet-stream",
         size: body?.size ?? 0,
       };
@@ -278,6 +327,9 @@ export async function extractContent(
       const cid = header(part.headers ?? undefined, "Content-ID").replace(/^<|>$/g, "");
       if (cid) meta.contentId = cid;
       attachments.push(meta);
+      // Don't descend: an attached email's (message/rfc822) parts are its own
+      // content, not this message's body.
+      return;
     } else if (mimeType === "text/plain" || mimeType === "text/html") {
       const kind = mimeType === "text/plain" ? "plain" : "html";
       if (body?.data) textParts.push({ kind, data: body.data });
@@ -301,8 +353,14 @@ export async function extractContent(
     }),
   );
 
-  const plain = decoded.filter((d) => d.kind === "plain").map((d) => d.text).join("\n");
-  const html = decoded.filter((d) => d.kind === "html").map((d) => d.text).join("\n");
+  // Normalize CRLF/CR line endings to \n (as the connector does).
+  const join = (kind: "plain" | "html") =>
+    decoded
+      .filter((d) => d.kind === kind)
+      .map((d) => d.text.replace(/\r\n?/g, "\n"))
+      .join("\n");
+  const plain = join("plain");
+  const html = join("html");
   return { plain, html, attachments };
 }
 
@@ -348,10 +406,13 @@ function apiFormat(format: MessageFormat): "metadata" | "full" | "raw" {
 export interface MessageOut {
   id: string;
   threadId?: string;
-  from?: string;
-  to?: string;
-  cc?: string;
-  bcc?: string;
+  /** Sender email address (display name is in addressDisplayNames). */
+  sender?: string;
+  toRecipients?: string[];
+  ccRecipients?: string[];
+  bccRecipients?: string[];
+  /** Display names for addresses in sender/to/cc/bcc that have one. */
+  addressDisplayNames?: AddressDisplayName[];
   replyTo?: string;
   date?: string;
   internalDate?: string;
@@ -360,9 +421,10 @@ export interface MessageOut {
   viewUrl: string;
   /** RFC 822 Message-ID header (useful for threading / rfc822msgid: search). */
   rfc822MessageId?: string;
+  historyId?: string;
   subject?: string;
   snippet?: string;
-  body?: string;
+  plaintextBody?: string;
   bodyTotalBytes?: number;
   bodyTruncated?: boolean;
   nextBodyOffset?: number;
@@ -370,6 +432,7 @@ export interface MessageOut {
   htmlBodyTotalBytes?: number;
   htmlBodyTruncated?: boolean;
   nextHtmlBodyOffset?: number;
+  attachmentIds?: string[];
   attachments?: AttachmentMeta[];
   raw?: string;
   rawTotalBytes?: number;
@@ -380,6 +443,43 @@ export interface MessageOut {
 export interface BodyWindow {
   bodyOffset?: number;
   htmlBodyOffset?: number;
+}
+
+export interface AddressDisplayName {
+  emailAddress: string;
+  displayName: string;
+}
+
+/** sender / to/cc/bccRecipients / addressDisplayNames from message headers. */
+function addressFields(h: gmail_v1.Schema$MessagePartHeader[] | undefined): {
+  sender?: string;
+  toRecipients?: string[];
+  ccRecipients?: string[];
+  bccRecipients?: string[];
+  addressDisplayNames?: AddressDisplayName[];
+} {
+  const names = new Map<string, string>(); // lowercased email -> entry, first wins
+  const display: AddressDisplayName[] = [];
+  const emails = (value: string) =>
+    parseAddressList(value).map((a) => {
+      const key = a.email.toLowerCase();
+      if (a.name && a.name !== a.email && !names.has(key)) {
+        names.set(key, a.name);
+        display.push({ emailAddress: a.email, displayName: a.name });
+      }
+      return a.email;
+    });
+  const out: ReturnType<typeof addressFields> = {};
+  const from = emails(header(h, "From"));
+  if (from.length) out.sender = from[0];
+  const to = emails(header(h, "To"));
+  if (to.length) out.toRecipients = to;
+  const cc = emails(header(h, "Cc"));
+  if (cc.length) out.ccRecipients = cc;
+  const bcc = emails(header(h, "Bcc"));
+  if (bcc.length) out.bccRecipients = bcc;
+  if (display.length) out.addressDisplayNames = display;
+  return out;
 }
 
 function setIf<T extends object, K extends keyof T>(obj: T, key: K, value: T[K] | "" | undefined) {
@@ -395,14 +495,15 @@ async function shapeMessage(
   window: BodyWindow = {},
 ): Promise<MessageOut> {
   const id = msg.id ?? "";
-  const out: MessageOut = { id, viewUrl: viewUrl(ctx.email, id) };
+  const out: MessageOut = { id, viewUrl: viewUrl(ctx.email, msg.threadId ?? id, id) };
   setIf(out, "threadId", msg.threadId ?? undefined);
+  setIf(out, "historyId", msg.historyId ?? undefined);
   if (msg.labelIds) out.labelIds = msg.labelIds;
   if (msg.sizeEstimate != null) out.sizeEstimate = msg.sizeEstimate;
   setIf(out, "internalDate", msg.internalDate ?? undefined);
 
   if (format === "RAW") {
-    setIf(out, "snippet", msg.snippet ?? undefined);
+    setIf(out, "snippet", decodeEntities(msg.snippet ?? ""));
     const rawText = decodeBase64Url(msg.raw ?? "").toString("utf8");
     const slice = sliceUtf8(rawText, window.bodyOffset ?? 0, MAX_BODY_BYTES);
     out.raw = slice.text;
@@ -415,28 +516,30 @@ async function shapeMessage(
   }
 
   const h = msg.payload?.headers ?? undefined;
-  setIf(out, "from", header(h, "From"));
-  setIf(out, "to", header(h, "To"));
-  setIf(out, "cc", header(h, "Cc"));
-  setIf(out, "bcc", header(h, "Bcc"));
+  Object.assign(out, addressFields(h));
   setIf(out, "replyTo", header(h, "Reply-To"));
-  setIf(out, "date", header(h, "Date"));
+  setIf(out, "date", isoDate(msg.internalDate, header(h, "Date")));
   setIf(out, "rfc822MessageId", header(h, "Message-ID"));
   if (format === "METADATA_ONLY") return out;
 
   out.subject = header(h, "Subject");
-  out.snippet = msg.snippet ?? "";
+  // Gmail returns snippets HTML-escaped (&#39; &amp; ...); decode for readability.
+  out.snippet = decodeEntities(msg.snippet ?? "");
   if (format === "MINIMAL") return out;
 
   const content = await extractContent(gmail, id, msg.payload);
   const body = sliceUtf8(bestPlainText(content), window.bodyOffset ?? 0, MAX_BODY_BYTES);
-  out.body = body.text;
+  out.plaintextBody = body.text;
   out.bodyTotalBytes = body.totalBytes;
   if (body.nextOffset !== undefined) {
     out.bodyTruncated = true;
     out.nextBodyOffset = body.nextOffset;
   }
-  if (content.attachments.length > 0) out.attachments = content.attachments;
+  if (content.attachments.length > 0) {
+    const ids = content.attachments.map((a) => a.attachmentId).filter((x): x is string => !!x);
+    if (ids.length) out.attachmentIds = ids;
+    out.attachments = content.attachments;
+  }
 
   if (format === "FULL_CONTENT" && content.html) {
     const html = sliceUtf8(content.html, window.htmlBodyOffset ?? 0, MAX_BODY_BYTES);
@@ -480,6 +583,8 @@ export function normalizeThreadView(view?: string): ThreadView {
 const SEARCH_MESSAGES_PER_THREAD = 5;
 
 export interface ThreadSummary {
+  /** Thread ID (connector name); threadId is the same value. */
+  id: string;
   threadId: string;
   viewUrl: string;
   messageCount?: number;
@@ -490,7 +595,8 @@ export interface SearchThreadsResult {
   account: string;
   threads: ThreadSummary[];
   nextPageToken?: string;
-  resultSizeEstimate?: number;
+  /** Approximate total matches (string, as the connector returns it). */
+  resultCountEstimate?: string;
   note: string;
 }
 
@@ -527,7 +633,11 @@ export async function searchThreads(
   const stubs = list.data.threads ?? [];
   let threads: ThreadSummary[];
   if (view === "IDS_ONLY") {
-    threads = stubs.map((s) => ({ threadId: s.id ?? "", viewUrl: viewUrl(ctx.email, s.id ?? "") }));
+    threads = stubs.map((s) => ({
+      id: s.id ?? "",
+      threadId: s.id ?? "",
+      viewUrl: viewUrl(ctx.email, s.id ?? ""),
+    }));
   } else {
     const msgFormat: MessageFormat = view === "METADATA_ONLY" ? "METADATA_ONLY" : "MINIMAL";
     threads = await mapLimit(stubs, FANOUT_CONCURRENCY, async (stub) => {
@@ -547,6 +657,7 @@ export async function searchThreads(
       );
       const threadId = detail.data.id ?? stub.id ?? "";
       return {
+        id: threadId,
         threadId,
         viewUrl: viewUrl(ctx.email, threadId),
         messageCount: all.length,
@@ -564,7 +675,9 @@ export async function searchThreads(
         : `Message bodies are not included; at most the ${view === "SUMMARY" ? "latest message" : `${SEARCH_MESSAGES_PER_THREAD} most recent messages`} per thread are shown (see messageCount). Use get_thread to read every message.`,
   };
   if (list.data.nextPageToken) result.nextPageToken = list.data.nextPageToken;
-  if (list.data.resultSizeEstimate != null) result.resultSizeEstimate = list.data.resultSizeEstimate;
+  if (list.data.resultSizeEstimate != null) {
+    result.resultCountEstimate = String(list.data.resultSizeEstimate);
+  }
   return result;
 }
 
@@ -670,14 +783,7 @@ export async function createDraft(
   auth: OAuth2Client,
   ctx: AccountCtx,
   params: CreateDraftParams,
-): Promise<{
-  account: string;
-  draftId: string;
-  messageId?: string;
-  threadId?: string;
-  to?: string[];
-  viewUrl?: string;
-}> {
+): Promise<DraftResult> {
   const gmail = gmailClient(auth);
   assertAttachmentSize(params.attachments);
 
@@ -764,35 +870,46 @@ export async function createDraft(
     }),
   );
 
-  const out: {
-    account: string;
-    draftId: string;
-    messageId?: string;
-    threadId?: string;
-    to?: string[];
-    viewUrl?: string;
-  } = { account: ctx.alias, draftId: res.data.id ?? "" };
-  if (res.data.message?.id) {
-    out.messageId = res.data.message.id;
-    out.viewUrl = draftViewUrl(ctx.email, res.data.message.id);
+  return draftResult(ctx, res.data);
+}
+
+export interface DraftResult {
+  account: string;
+  /** Draft ID (connector name); draftId is the same value. */
+  id: string;
+  draftId: string;
+  messageId?: string;
+  threadId?: string;
+  viewUrl?: string;
+}
+
+function draftResult(ctx: AccountCtx, draft: gmail_v1.Schema$Draft): DraftResult {
+  const id = draft.id ?? "";
+  const out: DraftResult = { account: ctx.alias, id, draftId: id };
+  if (draft.message?.id) {
+    out.messageId = draft.message.id;
+    out.viewUrl = draftViewUrl(ctx.email, draft.message.id);
   }
-  if (res.data.message?.threadId) out.threadId = res.data.message.threadId;
-  if (to.length) out.to = to;
+  if (draft.message?.threadId) out.threadId = draft.message.threadId;
   return out;
 }
 
 export interface DraftSummary {
+  /** Draft ID (connector name); draftId is the same value. */
+  id: string;
   draftId: string;
   messageId: string;
   threadId?: string;
   subject: string;
-  to?: string;
-  cc?: string;
-  bcc?: string;
+  sender?: string;
+  toRecipients?: string[];
+  ccRecipients?: string[];
+  bccRecipients?: string[];
+  addressDisplayNames?: AddressDisplayName[];
   date?: string;
   snippet: string;
   viewUrl: string;
-  body?: string;
+  plaintextBody?: string;
   bodyTruncated?: boolean;
 }
 
@@ -827,21 +944,20 @@ export async function listDrafts(
     );
     const h = msg.data.payload?.headers ?? undefined;
     const d: DraftSummary = {
+      id: stub.id ?? "",
       draftId: stub.id ?? "",
       messageId: msgId,
       subject: header(h, "Subject"),
-      snippet: msg.data.snippet ?? "",
+      snippet: decodeEntities(msg.data.snippet ?? ""),
       viewUrl: draftViewUrl(ctx.email, msgId),
+      ...addressFields(h),
     };
     setIf(d, "threadId", msg.data.threadId ?? undefined);
-    setIf(d, "to", header(h, "To"));
-    setIf(d, "cc", header(h, "Cc"));
-    setIf(d, "bcc", header(h, "Bcc"));
-    setIf(d, "date", header(h, "Date"));
+    setIf(d, "date", isoDate(msg.data.internalDate, header(h, "Date")));
     if (full) {
       const content = await extractContent(gmail, msgId, msg.data.payload);
       const slice = sliceUtf8(bestPlainText(content), 0, MAX_BODY_BYTES);
-      d.body = slice.text;
+      d.plaintextBody = slice.text;
       if (slice.nextOffset !== undefined) d.bodyTruncated = true;
     }
     return d;
@@ -859,7 +975,7 @@ export async function getDraft(
   auth: OAuth2Client,
   ctx: AccountCtx,
   params: { draftId: string; messageFormat?: string } & BodyWindow,
-): Promise<{ account: string; draftId: string; message: MessageOut; note?: string }> {
+): Promise<{ account: string; id: string; draftId: string; message: MessageOut; note?: string }> {
   const gmail = gmailClient(auth);
   const format = normalizeFormat(params.messageFormat);
   const res = await withRetry(() =>
@@ -868,13 +984,93 @@ export async function getDraft(
   const msg = res.data.message ?? {};
   const message = await shapeMessage(gmail, ctx, msg, format, params);
   if (msg.id) message.viewUrl = draftViewUrl(ctx.email, msg.id);
-  const out: { account: string; draftId: string; message: MessageOut; note?: string } = {
+  const draftId = res.data.id ?? params.draftId;
+  const out: { account: string; id: string; draftId: string; message: MessageOut; note?: string } = {
     account: ctx.alias,
-    draftId: res.data.id ?? params.draftId,
+    id: draftId,
+    draftId,
     message,
   };
   if (message.bodyTruncated || message.htmlBodyTruncated || message.rawTruncated) {
     out.note = "Content truncated; call get_draft again with bodyOffset/htmlBodyOffset set to the next* offset.";
+  }
+  return out;
+}
+
+export interface UpdateDraftParams {
+  draftId: string;
+  to?: string[];
+  cc?: string[];
+  bcc?: string[];
+  subject?: string;
+  body?: string;
+  htmlBody?: string;
+  attachments?: MimeAttachment[];
+}
+
+/**
+ * Update a draft with merge semantics (matching the connector):
+ *   - to/cc/bcc/subject: non-empty values replace; omitted/empty keep the existing value.
+ *   - body/htmlBody: both omitted keeps the existing body; body only -> plain-text
+ *     draft (HTML cleared); htmlBody only -> HTML draft (plain text cleared).
+ *   - attachments are NOT merged: the draft ends up with exactly `attachments`.
+ * Threading (threadId, In-Reply-To, References) is preserved.
+ */
+export async function updateDraft(
+  auth: OAuth2Client,
+  ctx: AccountCtx,
+  params: UpdateDraftParams,
+): Promise<DraftResult & { removedAttachments?: string[] }> {
+  const gmail = gmailClient(auth);
+  assertAttachmentSize(params.attachments);
+
+  const existing = await withRetry(() =>
+    gmail.users.drafts.get({ userId: "me", id: params.draftId, format: "full" }),
+  );
+  const msg = existing.data.message ?? {};
+  const h = msg.payload?.headers ?? undefined;
+
+  const pick = (given: string[] | undefined, headerName: string): string[] => {
+    const cleaned = (given ?? []).map((a) => a.trim()).filter(Boolean);
+    if (cleaned.length) return cleaned;
+    const current = header(h, headerName);
+    return current ? [current] : [];
+  };
+
+  let body = params.body || undefined;
+  let htmlBody = params.htmlBody || undefined;
+  const content = await extractContent(gmail, msg.id ?? "", msg.payload);
+  if (body === undefined && htmlBody === undefined) {
+    if (content.plain) body = content.plain;
+    if (content.html) htmlBody = content.html;
+  }
+
+  const raw = buildMimeMessage({
+    to: pick(params.to, "To"),
+    cc: pick(params.cc, "Cc"),
+    bcc: pick(params.bcc, "Bcc"),
+    subject: params.subject || header(h, "Subject"),
+    body,
+    htmlBody,
+    attachments: params.attachments,
+    inReplyTo: header(h, "In-Reply-To") || undefined,
+    references: header(h, "References") || undefined,
+  });
+
+  const res = await withRetry(() =>
+    gmail.users.drafts.update({
+      userId: "me",
+      id: params.draftId,
+      requestBody: {
+        id: params.draftId,
+        message: { raw, ...(msg.threadId ? { threadId: msg.threadId } : {}) },
+      },
+    }),
+  );
+
+  const out: DraftResult & { removedAttachments?: string[] } = draftResult(ctx, res.data);
+  if (!params.attachments?.length && content.attachments.length) {
+    out.removedAttachments = content.attachments.map((a) => a.filename);
   }
   return out;
 }
@@ -901,6 +1097,8 @@ export interface LabelInfo {
   type: string;
   textColor?: string;
   backgroundColor?: string;
+  labelListVisibility?: string;
+  messageListVisibility?: string;
 }
 
 function toLabelInfo(label: gmail_v1.Schema$Label): LabelInfo {
@@ -911,6 +1109,8 @@ function toLabelInfo(label: gmail_v1.Schema$Label): LabelInfo {
   };
   if (label.color?.textColor) info.textColor = label.color.textColor;
   if (label.color?.backgroundColor) info.backgroundColor = label.color.backgroundColor;
+  if (label.labelListVisibility) info.labelListVisibility = label.labelListVisibility;
+  if (label.messageListVisibility) info.messageListVisibility = label.messageListVisibility;
   return info;
 }
 
@@ -1000,39 +1200,158 @@ function colorObject(
   return undefined;
 }
 
+/** Connector color presets -> Gmail palette colors (background, text). */
+export const LABEL_COLOR_PRESETS: Record<string, { backgroundColor: string; textColor: string }> = {
+  LABEL_COLOR_PRESET_BLACK: { backgroundColor: "#000000", textColor: "#ffffff" },
+  LABEL_COLOR_PRESET_DARK_GRAY: { backgroundColor: "#434343", textColor: "#ffffff" },
+  LABEL_COLOR_PRESET_GRAY: { backgroundColor: "#666666", textColor: "#ffffff" },
+  LABEL_COLOR_PRESET_LIGHT_GRAY: { backgroundColor: "#cccccc", textColor: "#000000" },
+  LABEL_COLOR_PRESET_WHITE: { backgroundColor: "#ffffff", textColor: "#000000" },
+  LABEL_COLOR_PRESET_RED: { backgroundColor: "#fb4c2f", textColor: "#ffffff" },
+  LABEL_COLOR_PRESET_ORANGE: { backgroundColor: "#ffad47", textColor: "#000000" },
+  LABEL_COLOR_PRESET_YELLOW: { backgroundColor: "#fad165", textColor: "#000000" },
+  LABEL_COLOR_PRESET_GREEN: { backgroundColor: "#16a765", textColor: "#ffffff" },
+  LABEL_COLOR_PRESET_MINT: { backgroundColor: "#43d692", textColor: "#000000" },
+  LABEL_COLOR_PRESET_TEAL: { backgroundColor: "#2da2bb", textColor: "#ffffff" },
+  LABEL_COLOR_PRESET_BLUE: { backgroundColor: "#4a86e8", textColor: "#ffffff" },
+  LABEL_COLOR_PRESET_PURPLE: { backgroundColor: "#a479e2", textColor: "#ffffff" },
+  LABEL_COLOR_PRESET_PINK: { backgroundColor: "#f691b2", textColor: "#000000" },
+  LABEL_COLOR_PRESET_DARK_RED: { backgroundColor: "#822111", textColor: "#ffffff" },
+  LABEL_COLOR_PRESET_DARK_ORANGE: { backgroundColor: "#a46a21", textColor: "#ffffff" },
+  LABEL_COLOR_PRESET_DARK_GREEN: { backgroundColor: "#076239", textColor: "#ffffff" },
+  LABEL_COLOR_PRESET_DARK_BLUE: { backgroundColor: "#1c4587", textColor: "#ffffff" },
+  LABEL_COLOR_PRESET_DARK_PURPLE: { backgroundColor: "#41236d", textColor: "#ffffff" },
+  LABEL_COLOR_PRESET_DARK_PINK: { backgroundColor: "#83334c", textColor: "#ffffff" },
+  LABEL_COLOR_PRESET_BROWN: { backgroundColor: "#7a4706", textColor: "#ffffff" },
+};
+
+const LABEL_LIST_VISIBILITY: Record<string, string> = {
+  LABEL_SHOW: "labelShow",
+  LABEL_SHOW_IF_UNREAD: "labelShowIfUnread",
+  LABEL_HIDE: "labelHide",
+};
+const MESSAGE_LIST_VISIBILITY: Record<string, string> = { SHOW: "show", HIDE: "hide" };
+
+export interface LabelStyleParams {
+  colorPreset?: string;
+  /** Deprecated (connector): raw colors object. */
+  color?: { textColor?: string; backgroundColor?: string };
+  /** Legacy flat raw colors. */
+  textColor?: string;
+  backgroundColor?: string;
+  labelListVisibility?: string;
+  messageListVisibility?: string;
+}
+
+/** Resolve preset / raw colors and visibility into Gmail label fields. */
+export function labelStyle(p: LabelStyleParams): gmail_v1.Schema$Label {
+  const out: gmail_v1.Schema$Label = {};
+  const preset =
+    p.colorPreset && p.colorPreset !== "LABEL_COLOR_PRESET_UNSPECIFIED" ? p.colorPreset : undefined;
+  const rawText = p.textColor ?? p.color?.textColor;
+  const rawBg = p.backgroundColor ?? p.color?.backgroundColor;
+  if (preset) {
+    const c = LABEL_COLOR_PRESETS[preset];
+    if (!c) throw new GmailError(`Unknown colorPreset "${preset}".`);
+    if (rawText || rawBg) {
+      throw new GmailError("Use either colorPreset or raw colors, not both.");
+    }
+    out.color = { ...c };
+  } else {
+    const color = colorObject(rawText, rawBg);
+    if (color) out.color = color;
+  }
+  const llv = p.labelListVisibility;
+  if (llv && llv !== "LABEL_LIST_VISIBILITY_UNSPECIFIED") {
+    const v = LABEL_LIST_VISIBILITY[llv];
+    if (!v) throw new GmailError(`Unknown labelListVisibility "${llv}".`);
+    out.labelListVisibility = v;
+  }
+  const mlv = p.messageListVisibility;
+  if (mlv && mlv !== "MESSAGE_LIST_VISIBILITY_UNSPECIFIED") {
+    const v = MESSAGE_LIST_VISIBILITY[mlv];
+    if (!v) throw new GmailError(`Unknown messageListVisibility "${mlv}".`);
+    out.messageListVisibility = v;
+  }
+  return out;
+}
+
+/** "A/B/C" -> ["A", "A/B"]: the ancestors that must exist for nesting. */
+export function parentLabelNames(name: string): string[] {
+  const segments = name.split("/");
+  const out: string[] = [];
+  for (let i = 1; i < segments.length; i++) out.push(segments.slice(0, i).join("/"));
+  return out.filter((n) => n.trim() && !n.endsWith("/"));
+}
+
+function isConflict(err: any): boolean {
+  return httpStatus(err) === 409 || /exists|conflict/i.test(String(err?.message ?? ""));
+}
+
 export async function createLabel(
   auth: OAuth2Client,
   ctx: AccountCtx,
-  params: { name: string; textColor?: string; backgroundColor?: string },
-): Promise<{ account: string; label: LabelInfo }> {
+  params: { displayName: string; autoCreateParentLabels?: boolean } & LabelStyleParams,
+): Promise<{ account: string; label: LabelInfo; createdParentLabels?: LabelInfo[] }> {
   const gmail = gmailClient(auth);
-  const color = colorObject(params.textColor, params.backgroundColor);
+  const name = params.displayName.trim();
+  if (!name) throw new GmailError("displayName is required.");
+  const style = labelStyle(params);
+
+  const createdParents: LabelInfo[] = [];
+  if (params.autoCreateParentLabels ?? true) {
+    const parents = parentLabelNames(name);
+    if (parents.length) {
+      const list = await withRetry(() => gmail.users.labels.list({ userId: "me" }));
+      const existing = new Set((list.data.labels ?? []).map((l) => (l.name ?? "").toLowerCase()));
+      for (const parent of parents) {
+        if (existing.has(parent.toLowerCase())) continue;
+        try {
+          const r = await withRetry(() =>
+            gmail.users.labels.create({
+              userId: "me",
+              requestBody: { name: parent, labelListVisibility: "labelShow", messageListVisibility: "show" },
+            }),
+          );
+          createdParents.push(toLabelInfo(r.data));
+        } catch (err) {
+          if (!isConflict(err)) throw err; // created concurrently: fine
+        }
+      }
+    }
+  }
+
   const res = await withRetry(() =>
     gmail.users.labels.create({
       userId: "me",
       requestBody: {
-        name: params.name,
+        name,
         labelListVisibility: "labelShow",
         messageListVisibility: "show",
-        ...(color ? { color } : {}),
+        ...style,
       },
     }),
   );
-  return { account: ctx.alias, label: toLabelInfo(res.data) };
+  const out: { account: string; label: LabelInfo; createdParentLabels?: LabelInfo[] } = {
+    account: ctx.alias,
+    label: toLabelInfo(res.data),
+  };
+  if (createdParents.length) out.createdParentLabels = createdParents;
+  return out;
 }
 
 export async function updateLabel(
   auth: OAuth2Client,
   ctx: AccountCtx,
-  params: { labelId: string; name?: string; textColor?: string; backgroundColor?: string },
+  params: { labelId: string; displayName?: string } & LabelStyleParams,
 ): Promise<{ account: string; label: LabelInfo }> {
   const gmail = gmailClient(auth);
-  const color = colorObject(params.textColor, params.backgroundColor);
-  const requestBody: gmail_v1.Schema$Label = {};
-  if (params.name !== undefined) requestBody.name = params.name;
-  if (color) requestBody.color = color;
+  const requestBody: gmail_v1.Schema$Label = labelStyle(params);
+  if (params.displayName?.trim()) requestBody.name = params.displayName.trim();
   if (Object.keys(requestBody).length === 0) {
-    throw new GmailError("Nothing to update: provide a new name and/or colors.");
+    throw new GmailError(
+      "Nothing to update: provide displayName, colorPreset, or a visibility setting.",
+    );
   }
   const res = await withRetry(() =>
     gmail.users.labels.patch({ userId: "me", id: params.labelId, requestBody }),
@@ -1064,6 +1383,15 @@ export async function deleteLabel(
 // ---------------------------------------------------------------------------
 // Label / unlabel messages & threads
 // ---------------------------------------------------------------------------
+
+/** unlabel_* must not remove SPAM (use unmark_*_spam), matching the connector. */
+export function assertNoSpamRemoval(labelIds: string[], kind: "message" | "thread"): void {
+  if (labelIds.some((l) => l.toUpperCase() === "SPAM")) {
+    throw new GmailError(
+      `SPAM cannot be removed with unlabel_${kind}; use unmark_${kind}_spam instead.`,
+    );
+  }
+}
 
 export async function modifyMessageLabels(
   auth: OAuth2Client,

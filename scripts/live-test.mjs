@@ -176,14 +176,14 @@ try {
       const gm = await call("get_message", { messageId, account: A });
       check(
         `get_message PLAIN_TEXT [${A}]`,
-        !gm.isError && gm.json?.message?.id === messageId && typeof gm.json?.message?.body === "string",
+        !gm.isError && gm.json?.message?.id === messageId && typeof gm.json?.message?.plaintextBody === "string",
         gm.text.slice(0, 120),
       );
       check(`get_message has viewUrl [${A}]`, !!gm.json?.message?.viewUrl);
       const gmMeta = await call("get_message", { messageId, messageFormat: "METADATA_ONLY", account: A });
       check(
         `get_message METADATA_ONLY omits body/subject [${A}]`,
-        !gmMeta.isError && gmMeta.json?.message?.body === undefined && gmMeta.json?.message?.subject === undefined,
+        !gmMeta.isError && gmMeta.json?.message?.plaintextBody === undefined && gmMeta.json?.message?.subject === undefined,
       );
       const gmRaw = await call("get_message", { messageId, messageFormat: "RAW", account: A });
       check(`get_message RAW [${A}]`, !gmRaw.isError && /\r?\n\r?\n/.test(gmRaw.json?.message?.raw ?? ""));
@@ -193,7 +193,7 @@ try {
           bodyOffset: gm.json.message.nextBodyOffset,
           account: A,
         });
-        check(`get_message bodyOffset continues [${A}]`, !gm2.isError && !!gm2.json?.message?.body);
+        check(`get_message bodyOffset continues [${A}]`, !gm2.isError && !!gm2.json?.message?.plaintextBody);
       }
 
       // --- search_threads views -------------------------------------------
@@ -211,7 +211,7 @@ try {
       if (!READ_ONLY) {
         // --- label lifecycle (create -> use -> rename -> delete) ----------
         const labelName = `multi-gmail-mcp-test/run-${Date.now()}-${A}`;
-        const cl = await call("create_label", { name: labelName, account: A });
+        const cl = await call("create_label", { displayName: labelName, colorPreset: "LABEL_COLOR_PRESET_BLUE", account: A });
         const labelId = cl.json?.label?.id;
         check(`create_label [${A}]`, !cl.isError && !!labelId, cl.text.slice(0, 120));
 
@@ -290,7 +290,7 @@ try {
           // --- update_label ------------------------------------------------
           const upd = await call("update_label", {
             labelId,
-            name: `${labelName}-renamed`,
+            displayName: `${labelName}-renamed`,
             account: A,
           });
           check(`update_label [${A}]`, !upd.isError, upd.text.slice(0, 120));
@@ -335,7 +335,7 @@ try {
         const gd = await call("get_draft", { draftId, account: A });
         check(
           `get_draft [${A}]`,
-          !gd.isError && (gd.json?.message?.body ?? "").includes("Automated test draft"),
+          !gd.isError && (gd.json?.message?.plaintextBody ?? "").includes("Automated test draft"),
           gd.text.slice(0, 120),
         );
         const ldq = await call("list_drafts", {
@@ -346,7 +346,7 @@ try {
         check(
           `list_drafts query + DRAFT_VIEW_FULL [${A}]`,
           !ldq.isError &&
-            (ldq.json?.drafts ?? []).some((d) => d.draftId === draftId && typeof d.body === "string"),
+            (ldq.json?.drafts ?? []).some((d) => d.draftId === draftId && typeof d.plaintextBody === "string"),
         );
 
         // --- delete_draft (cleanup + round-trip test) --------------------
@@ -377,7 +377,7 @@ try {
         check(`create_draft reply [${A}]`, !rd.isError && !!rdId && !!rd.json?.viewUrl, rd.text.slice(0, 120));
         if (rdId) {
           const rg = await call("get_draft", { draftId: rdId, account: A });
-          const body = rg.json?.message?.body ?? "";
+          const body = rg.json?.message?.plaintextBody ?? "";
           check(`reply draft quotes original [${A}]`, /wrote:\n>/.test(body), body.slice(0, 120));
           check(`reply draft inherits Re: subject [${A}]`, /^re:/i.test(rg.json?.message?.subject ?? ""));
 
