@@ -21,6 +21,7 @@ import {
   sliceUtf8,
   quotePlain,
   quoteHtml,
+  replyAttribution,
   plainToHtml,
   parseAddressList,
   decodeEntities,
@@ -364,6 +365,126 @@ export async function extractContent(
   return { plain, html, attachments };
 }
 
+// ---------------------------------------------------------------------------
+// download_gmail_attachment
+// ---------------------------------------------------------------------------
+
+/** Largest attachment returned inline in a tool result (the connector's limit). */
+export const MAX_INLINE_ATTACHMENT_BYTES = 12 * 1024 * 1024;
+
+export interface DownloadedAttachment {
+  account: string;
+  messageId: string;
+  filename: string;
+  mimeType: string;
+  size: number;
+  data: Buffer;
+}
+
+/** Every attachment part of a payload, in document order. */
+function attachmentParts(payload: gmail_v1.Schema$MessagePart | undefined): gmail_v1.Schema$MessagePart[] {
+  const out: gmail_v1.Schema$MessagePart[] = [];
+  const walk = (part: gmail_v1.Schema$MessagePart | undefined) => {
+    if (!part) return;
+    if (isAttachmentPart(part)) {
+      out.push(part);
+      return;
+    }
+    for (const child of part.parts ?? []) walk(child);
+  };
+  walk(payload);
+  return out;
+}
+
+function partFilename(part: gmail_v1.Schema$MessagePart): string {
+  return part.filename || ((part.mimeType ?? "").toLowerCase() === "message/rfc822" ? "attached-message.eml" : "(unnamed)");
+}
+
+/**
+ * Fetch one attachment's bytes. The attachment is chosen by attachmentIndex,
+ * else attachmentId, else filename (+ mimeType). Gmail's attachment IDs change
+ * between fetches, so an ID that no longer matches a part is still tried
+ * directly before falling back to the filename. When nothing identifies a
+ * single attachment, the error lists them with their indexes.
+ */
+export async function downloadAttachment(
+  auth: OAuth2Client,
+  ctx: AccountCtx,
+  params: { messageId: string; attachmentId?: string; filename?: string; mimeType?: string; attachmentIndex?: number },
+): Promise<DownloadedAttachment> {
+  const gmail = gmailClient(auth);
+  const msg = await withRetry(() =>
+    gmail.users.messages.get({ userId: "me", id: params.messageId, format: "full" }),
+  );
+  const parts = attachmentParts(msg.data.payload);
+  if (parts.length === 0) throw new GmailError(`Message ${params.messageId} has no attachments.`);
+
+  const listing = () =>
+    parts
+      .map((p, i) => `  ${i}: ${partFilename(p)} (${p.mimeType || "application/octet-stream"}, ${p.body?.size ?? 0} bytes)`)
+      .join("\n");
+
+  let part: gmail_v1.Schema$MessagePart | undefined;
+  let staleId: string | undefined;
+  if (params.attachmentIndex !== undefined) {
+    part = parts[params.attachmentIndex];
+    if (!part) {
+      throw new GmailError(`attachmentIndex ${params.attachmentIndex} is out of range. Attachments:\n${listing()}`);
+    }
+  } else {
+    if (params.attachmentId) part = parts.find((p) => p.body?.attachmentId === params.attachmentId);
+    if (!part && params.filename) {
+      let matches = parts.filter((p) => partFilename(p) === params.filename);
+      if (matches.length > 1 && params.mimeType) {
+        matches = matches.filter((p) => (p.mimeType ?? "").toLowerCase() === params.mimeType!.toLowerCase());
+      }
+      if (matches.length === 1) part = matches[0];
+    }
+    if (!part && params.attachmentId) staleId = params.attachmentId;
+    if (!part && !staleId && !params.filename && parts.length === 1) part = parts[0];
+    if (!part && !staleId) {
+      throw new GmailError(
+        "Couldn't identify the attachment. Call again with attachmentIndex set to one of:\n" + listing(),
+      );
+    }
+  }
+
+  let data: Buffer;
+  if (part?.body?.data) {
+    data = decodeBase64Url(part.body.data);
+  } else {
+    const id = part?.body?.attachmentId ?? staleId;
+    if (!id) {
+      throw new GmailError(
+        `Attachment "${part ? partFilename(part) : "?"}" has no downloadable content (an attached email ` +
+          "is shown by get_message in RAW format).",
+      );
+    }
+    try {
+      const res = await withRetry(() =>
+        gmail.users.messages.attachments.get({ userId: "me", messageId: params.messageId, id }),
+      );
+      data = decodeBase64Url(res.data.data ?? "");
+    } catch (err) {
+      if (!part && httpStatus(err) && httpStatus(err)! < 500) {
+        throw new GmailError(
+          "attachmentId not found on this message. Call again with attachmentIndex set to one of:\n" + listing(),
+        );
+      }
+      throw err;
+    }
+  }
+
+  return {
+    account: ctx.alias,
+    messageId: params.messageId,
+    filename: part ? partFilename(part) : params.filename || "attachment",
+    mimeType: part?.mimeType || params.mimeType || "application/octet-stream",
+    size: data.length,
+    data,
+  };
+}
+
 /** Best plain-text rendering: the text/plain part, else HTML converted to text. */
 function bestPlainText(content: ExtractedContent): string {
   return content.plain.trim() ? content.plain : htmlToText(content.html);
@@ -597,8 +718,32 @@ export interface SearchThreadsResult {
   nextPageToken?: string;
   /** Approximate total matches (string, as the connector returns it). */
   resultCountEstimate?: string;
+  /** True when resultCountEstimate is only a minimum (more than 500 matches). */
+  resultCountIsLowerBound?: boolean;
   note: string;
 }
+
+/**
+ * Gmail's resultSizeEstimate is exact for small result sets, but when it hasn't
+ * counted (typically with small pages) it returns a placeholder floor — 201, or
+ * 702 with 500-result pages — even for, say, 32 matches. Returns the count to
+ * report, or null when the estimate is that placeholder and must be counted
+ * another way. Exported for unit testing.
+ */
+export function searchCount(
+  returned: number,
+  estimate: number | null | undefined,
+  hasPageToken: boolean,
+  hasNextPage: boolean,
+): { resultCountEstimate?: string } | null {
+  if (!hasNextPage && !hasPageToken) return { resultCountEstimate: String(returned) };
+  if (estimate == null) return {};
+  if (hasNextPage && estimate >= 200) return null;
+  return { resultCountEstimate: String(Math.max(estimate, returned)) };
+}
+
+/** Max thread IDs listed to count a large result set. */
+const COUNT_PROBE_SIZE = 500;
 
 function isDraft(msg: gmail_v1.Schema$Message): boolean {
   return (msg.labelIds ?? []).includes("DRAFT");
@@ -675,8 +820,23 @@ export async function searchThreads(
         : `Message bodies are not included; at most the ${view === "SUMMARY" ? "latest message" : `${SEARCH_MESSAGES_PER_THREAD} most recent messages`} per thread are shown (see messageCount). Use get_thread to read every message.`,
   };
   if (list.data.nextPageToken) result.nextPageToken = list.data.nextPageToken;
-  if (list.data.resultSizeEstimate != null) {
-    result.resultCountEstimate = String(list.data.resultSizeEstimate);
+  const count = searchCount(stubs.length, list.data.resultSizeEstimate, !!params.pageToken, !!list.data.nextPageToken);
+  if (count) {
+    Object.assign(result, count);
+  } else if (!params.pageToken) {
+    // Count by listing up to 500 thread IDs (one cheap call): exact when they
+    // all fit, otherwise a true minimum.
+    const probe = await withRetry(() =>
+      gmail.users.threads.list({
+        userId: "me",
+        q: q || undefined,
+        maxResults: COUNT_PROBE_SIZE,
+        includeSpamTrash: params.includeTrash ? true : undefined,
+        fields: "threads/id,nextPageToken",
+      }),
+    );
+    result.resultCountEstimate = String(probe.data.threads?.length ?? 0);
+    if (probe.data.nextPageToken) result.resultCountIsLowerBound = true;
   }
   return result;
 }
@@ -795,6 +955,14 @@ export async function createDraft(
   let threadId: string | undefined;
   let subject = params.subject;
 
+  // Quoted replies are always written as HTML (like Gmail and the standard
+  // connector), so a plain-text-only reply gets an HTML version of its body.
+  // `body` stays as the text/plain alternative.
+  if (params.replyToMessageId && (params.quoteOriginal ?? true) && htmlBody === undefined) {
+    body = body ?? "";
+    htmlBody = plainToHtml(body);
+  }
+
   // Signature goes directly under the new text, above any quoted reply.
   if (params.includeSignature) {
     const sig = await defaultSignature(gmail);
@@ -840,7 +1008,13 @@ export async function createDraft(
 
     if (quote) {
       const content = await extractContent(gmail, original.data.id ?? "", original.data.payload);
-      const attribution = `On ${header(h, "Date")}, ${origFrom} wrote:`;
+      const dateHeader = header(h, "Date");
+      const when = original.data.internalDate
+        ? new Date(Number(original.data.internalDate))
+        : dateHeader
+          ? new Date(dateHeader)
+          : undefined;
+      const attribution = replyAttribution(origFrom, when, dateHeader);
       const origPlain = bestPlainText(content);
       if (htmlBody !== undefined) {
         htmlBody += "<br>" + quoteHtml(attribution, content.html || plainToHtml(origPlain));
@@ -1099,6 +1273,10 @@ export interface LabelInfo {
   backgroundColor?: string;
   labelListVisibility?: string;
   messageListVisibility?: string;
+  messagesTotal?: number;
+  messagesUnread?: number;
+  threadsTotal?: number;
+  threadsUnread?: number;
 }
 
 function toLabelInfo(label: gmail_v1.Schema$Label): LabelInfo {
@@ -1111,13 +1289,17 @@ function toLabelInfo(label: gmail_v1.Schema$Label): LabelInfo {
   if (label.color?.backgroundColor) info.backgroundColor = label.color.backgroundColor;
   if (label.labelListVisibility) info.labelListVisibility = label.labelListVisibility;
   if (label.messageListVisibility) info.messageListVisibility = label.messageListVisibility;
+  if (label.messagesTotal != null) info.messagesTotal = label.messagesTotal;
+  if (label.messagesUnread != null) info.messagesUnread = label.messagesUnread;
+  if (label.threadsTotal != null) info.threadsTotal = label.threadsTotal;
+  if (label.threadsUnread != null) info.threadsUnread = label.threadsUnread;
   return info;
 }
 
 export async function listLabels(
   auth: OAuth2Client,
   ctx: AccountCtx,
-  params: { pageSize?: number; pageToken?: string; includeSystem?: boolean },
+  params: { pageSize?: number; pageToken?: string; includeSystem?: boolean; includeCounts?: boolean },
 ): Promise<{ account: string; labels: LabelInfo[]; nextPageToken?: string; note: string }> {
   const gmail = gmailClient(auth);
   // Gmail's labels.list is not paginated server-side; it returns everything in
@@ -1135,8 +1317,19 @@ export async function listLabels(
 
   const offset = Number.parseInt(params.pageToken ?? "0", 10) || 0;
   const pageSize = params.pageSize && params.pageSize > 0 ? params.pageSize : labels.length;
-  const page = labels.slice(offset, offset + pageSize);
-  const nextOffset = offset + page.length;
+  const slice = labels.slice(offset, offset + pageSize);
+  const nextOffset = offset + slice.length;
+  // labels.list omits counts; fetch each label on this page for them.
+  const page = params.includeCounts === false
+    ? slice
+    : await mapLimit(slice, FANOUT_CONCURRENCY, async (l) => {
+        try {
+          const full = await withRetry(() => gmail.users.labels.get({ userId: "me", id: l.id }));
+          return toLabelInfo(full.data);
+        } catch {
+          return l; // counts are best-effort; keep the label without them
+        }
+      });
 
   const out: {
     account: string;

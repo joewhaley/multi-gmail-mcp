@@ -6,8 +6,10 @@ import {
   quotePlain,
   quoteHtml,
   plainToHtml,
+  formatQuoteDate,
+  replyAttribution,
 } from "../src/content.js";
-import { extractContent, normalizeFormat, normalizeThreadView } from "../src/gmail.js";
+import { extractContent, normalizeFormat, normalizeThreadView, searchCount } from "../src/gmail.js";
 
 const b64url = (s: string) =>
   Buffer.from(s, "utf8").toString("base64").replace(/\+/g, "-").replace(/\//g, "_");
@@ -42,6 +44,60 @@ describe("htmlToText", () => {
 
   it("keeps image alt text", () => {
     expect(htmlToText('<img src="x.png" alt="Logo">')).toBe("[image: Logo]");
+  });
+});
+
+describe("htmlToText: whitespace inside end tags", () => {
+  it("keeps adjacent links separate when </a> ends with a line break", () => {
+    // From a real Starlink email: each end tag is written as "</a\n>".
+    const html =
+      '<p><a href="https://s.com/support">Support</a\n> | <a href="https://s.com/privacy">Privacy</a\n>' +
+      ' | <a href="https://s.com/unsub">Unsubscribe</a\n></p\n><p>Footer</p >';
+    expect(htmlToText(html)).toBe(
+      "[Support](https://s.com/support) | [Privacy](https://s.com/privacy) | " +
+        "[Unsubscribe](https://s.com/unsub)\nFooter",
+    );
+  });
+
+  it("handles whitespace in </td>, </div> and <br> with attributes", () => {
+    expect(htmlToText("<table><tr><td>a</td\n><td>b</td ></tr\n></table>")).toBe("a\tb");
+    expect(htmlToText("<div>one</div\t>two<br class=\"x\">three")).toBe("one\ntwo\nthree");
+  });
+
+  it("drops <style> blocks whose end tag has whitespace", () => {
+    expect(htmlToText("<style>p{}</style\n>hi")).toBe("hi");
+  });
+});
+
+describe("reply attribution", () => {
+  const d = new Date("2026-11-25T23:04:00Z");
+  it("formats a Gmail-style date in the given zone", () => {
+    expect(formatQuoteDate(d, "America/Los_Angeles")).toBe("Wed, Nov 25, 2026 at 3:04 PM");
+    expect(formatQuoteDate(d, "UTC")).toBe("Wed, Nov 25, 2026 at 11:04 PM");
+  });
+  it("builds the attribution line, falling back to the raw header", () => {
+    expect(replyAttribution("A <a@b.com>", d, "raw", "UTC")).toBe(
+      "On Wed, Nov 25, 2026 at 11:04 PM A <a@b.com> wrote:",
+    );
+    expect(replyAttribution("A", new Date("nope"), "Tue, 1 Jan 2030")).toBe("On Tue, 1 Jan 2030 A wrote:");
+    expect(replyAttribution("A", undefined, "")).toBe("A wrote:");
+  });
+});
+
+describe("searchCount", () => {
+  it("is exact when everything fits on the first page", () => {
+    expect(searchCount(32, 201, false, false)).toEqual({ resultCountEstimate: "32" });
+    expect(searchCount(0, 0, false, false)).toEqual({ resultCountEstimate: "0" });
+  });
+  it("treats Gmail's 201/702 placeholder as unknown", () => {
+    expect(searchCount(1, 201, false, true)).toBeNull();
+    expect(searchCount(500, 702, false, true)).toBeNull();
+  });
+  it("trusts small estimates", () => {
+    expect(searchCount(20, 32, false, true)).toEqual({ resultCountEstimate: "32" });
+  });
+  it("never reports fewer than were returned", () => {
+    expect(searchCount(20, 5, true, false)).toEqual({ resultCountEstimate: "20" });
   });
 });
 

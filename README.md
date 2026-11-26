@@ -12,15 +12,16 @@ This server **creates drafts only — it never sends email.**
 
 | Tool | Purpose |
 | --- | --- |
-| `search_threads` | Search threads with full Gmail query syntax. Returns threadId, messageCount, viewUrl and up to 5 recent messages (no bodies). `view`: MINIMAL / METADATA_ONLY / SUMMARY / IDS_ONLY. |
+| `search_threads` | Search threads with full Gmail query syntax. Returns threadId, messageCount, viewUrl and up to 5 recent messages (no bodies). `resultCountEstimate` is exact up to 500 threads; past that it is a minimum flagged `resultCountIsLowerBound`. `view`: MINIMAL / METADATA_ONLY / SUMMARY / IDS_ONLY. |
 | `get_thread` | Fetch every message in a thread (drafts omitted). Formats: `PLAIN_TEXT` (default), `FULL_CONTENT` (+HTML), `MINIMAL`, `METADATA_ONLY`. |
 | `get_message` | Fetch one message, incl. `RAW` MIME source; page long bodies with `bodyOffset`. |
-| `create_draft` | Build a draft (text/html/attachments). Replies auto-thread, quote the original, and default `to` to the sender. Optional `includeSignature`. Never sends. |
+| `download_gmail_attachment` | Get an attachment's file (images as images, text as text, other files as an embedded resource; 12 MB inline limit), or save it to disk with `saveTo`. |
+| `create_draft` | Build a draft (text/html/attachments). Replies auto-thread, quote the original Gmail-style in HTML (plain `body` is converted), and default `to` to the sender. Optional `includeSignature`. Never sends. |
 | `list_drafts` | List drafts, optionally filtered by `query`; `DRAFT_VIEW_FULL` adds bodies. |
 | `get_draft` | Fetch one draft in any message format. |
 | `update_draft` | Edit a draft with merge semantics (omitted fields kept; attachments are replaced, not merged). |
 | `delete_draft` | Permanently delete a draft by ID (not moved to Trash). |
-| `list_labels` | List system + user labels (id, name, type, colors, visibility). |
+| `list_labels` | List system + user labels (id, name, type, colors, visibility, message/thread total and unread counts). |
 | `create_label` / `update_label` / `delete_label` | Create (auto-creating parents for `A/B/C`), rename/recolor (`colorPreset`), set visibility, delete user labels. |
 | `label_message` / `unlabel_message` | Add/remove labels on a message (`SPAM` can only be removed via `unmark_*_spam`). |
 | `update_message_labels` | Add and remove message labels atomically in one call. |
@@ -270,7 +271,7 @@ Source layout:
 - **`delete_draft` is permanent.** It removes the draft outright (not moved to Trash); it never touches sent or received messages.
 - **Bodies** are returned in ~50KB windows, split on UTF-8 character boundaries. A truncated body has `bodyTruncated: true` and `nextBodyOffset`; pass that to `get_message` as `bodyOffset` to read the rest. Large text parts that Gmail stores out-of-line are fetched automatically.
 - **HTML-only mail** is converted to text with links kept as `[text](url)`; `FULL_CONTENT` also returns the original HTML.
-- **Attachments**: metadata only (filename, mimeType, size, attachmentId, Content-ID); raw bytes are never returned.
+- **Attachments**: `get_message`/`get_thread` list metadata only (filename, mimeType, size, attachmentId, Content-ID); fetch the file with `download_gmail_attachment`.
 - **Inline images** in `create_draft`: reference them as `cid:attN` (N = position in `attachments`); `cid:<filename>` still works.
 - **Attachments** in `create_draft` must total ≤ 25MB; link large files from Drive instead.
 - **Rate limits** (Gmail's per-user, per-minute quota) are retried up to 6 times with exponential backoff (≈1s→16s, honoring `Retry-After`); **5xx** errors up to 3 times. Persistent failures return a clear error.

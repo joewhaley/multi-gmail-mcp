@@ -51,10 +51,10 @@ export function decodeEntities(text: string): string {
 export function htmlToText(html: string): string {
   let s = html
     .replace(/<!--[\s\S]*?-->/g, "")
-    .replace(/<(style|script|head|title)[\s\S]*?<\/\1>/gi, "");
+    .replace(/<(style|script|head|title)\b[\s\S]*?<\/\1\s*>/gi, "");
 
   // Links: keep the destination URL.
-  s = s.replace(/<a\b[^>]*?\bhref\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))[^>]*>([\s\S]*?)<\/a>/gi,
+  s = s.replace(/<a\b[^>]*?\bhref\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))[^>]*>([\s\S]*?)<\/a\s*>/gi,
     (_m, _q, dq, sq, bare, inner) => {
       const href = decodeEntities(String(dq ?? sq ?? bare ?? "").trim());
       const text = decodeEntities(String(inner).replace(/<[^>]+>/g, "")).replace(/\s+/g, " ").trim();
@@ -71,9 +71,9 @@ export function htmlToText(html: string): string {
 
   s = s
     .replace(/<li\b[^>]*>/gi, "\n- ")
-    .replace(/<\/(p|div|tr|h[1-6]|blockquote|table|ul|ol)>/gi, "\n")
-    .replace(/<(br|hr)\s*\/?>/gi, "\n")
-    .replace(/<\/t[dh]>/gi, "\t")
+    .replace(/<\/(p|div|tr|h[1-6]|blockquote|table|ul|ol)\s*>/gi, "\n")
+    .replace(/<(br|hr)\b[^>]*>/gi, "\n")
+    .replace(/<\/t[dh]\s*>/gi, "\t")
     .replace(/<[^>]+>/g, "");
 
   s = decodeEntities(s)
@@ -116,6 +116,29 @@ export function sliceUtf8(text: string, offset: number, maxBytes: number): Utf8S
   const out: Utf8Slice = { text: buf.subarray(start, end).toString("utf8"), totalBytes: total };
   if (end < total) out.nextOffset = end;
   return out;
+}
+
+/**
+ * Gmail-style attribution date, e.g. "Wed, Nov 25, 2026 at 3:04 PM", in the
+ * given IANA time zone (default: the server's local zone).
+ */
+export function formatQuoteDate(d: Date, timeZone?: string): string {
+  const date = new Intl.DateTimeFormat("en-US", {
+    weekday: "short", month: "short", day: "numeric", year: "numeric", timeZone,
+  }).format(d);
+  const time = new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit", timeZone })
+    .format(d)
+    .replace(/[\u202f\u00a0]/g, " ");
+  return `${date} at ${time}`;
+}
+
+/**
+ * Reply attribution line: "On <friendly date> <from> wrote:". Falls back to the
+ * raw Date header when no usable timestamp is available.
+ */
+export function replyAttribution(from: string, when: Date | undefined, rawDate: string, timeZone?: string): string {
+  const date = when && !Number.isNaN(when.getTime()) ? formatQuoteDate(when, timeZone) : rawDate;
+  return date ? `On ${date} ${from} wrote:` : `${from} wrote:`;
 }
 
 /** Plain-text reply quote: attribution line + "> "-prefixed original. */

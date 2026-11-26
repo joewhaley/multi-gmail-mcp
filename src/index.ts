@@ -5,6 +5,7 @@
  * The tool interface mirrors the standard Gmail MCP connector (same tool names,
  * parameters, and semantics) and adds an optional `account` selector to every
  * tool, plus list_accounts, delete_draft, update_label and delete_label.
+ * download_gmail_attachment can also save the file to local disk.
  *
  * Entry behavior:
  *   - `multi-gmail-mcp auth <alias>` runs the interactive OAuth flow.
@@ -13,6 +14,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { writeFileSync, mkdirSync, statSync } from "node:fs";
+import { join, resolve, basename } from "node:path";
 import type { OAuth2Client } from "google-auth-library";
 import {
   loadAccounts,
@@ -25,6 +28,8 @@ import {
   searchThreads,
   getThread,
   getMessage,
+  downloadAttachment,
+  MAX_INLINE_ATTACHMENT_BYTES,
   createDraft,
   listDrafts,
   getDraft,
@@ -52,8 +57,13 @@ import {
 // Shared response helpers + account-aware execution wrapper
 // ---------------------------------------------------------------------------
 
+type ContentBlock =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: string }
+  | { type: "resource"; resource: { uri: string; mimeType: string; blob: string } };
+
 type ToolResult = {
-  content: { type: "text"; text: string }[];
+  content: ContentBlock[];
   isError?: boolean;
 };
 
@@ -72,6 +82,7 @@ function fail(message: string): ToolResult {
 async function withAccount(
   account: string | undefined,
   fn: (auth: OAuth2Client, ctx: AccountCtx) => Promise<unknown>,
+  render: (data: any) => ToolResult = ok,
 ): Promise<ToolResult> {
   let aliasForError = account ?? "(default)";
   try {
@@ -79,11 +90,77 @@ async function withAccount(
     const resolved = resolveAccount(data, account);
     aliasForError = resolved.alias;
     const auth = getAuthClient(resolved.alias, resolved.config);
-    return ok(await fn(auth, { alias: resolved.alias, email: resolved.config.email }));
+    return render(await fn(auth, { alias: resolved.alias, email: resolved.config.email }));
   } catch (err) {
     if (err instanceof AccountError) return fail(err.message);
     return fail(describeGmailError(err, aliasForError).message);
   }
+}
+
+/** A file name safe to write: no directory parts or control characters. */
+function safeFilename(name: string): string {
+  // eslint-disable-next-line no-control-regex
+  const cleaned = basename(name).replace(/[\x00-\x1f/\\:]/g, "_").trim();
+  return cleaned && cleaned !== "." && cleaned !== ".." ? cleaned : "attachment";
+}
+
+function renderAttachment(
+  att: { account: string; messageId: string; filename: string; mimeType: string; size: number; data: Buffer },
+  saveTo?: string,
+): ToolResult {
+  const meta = {
+    account: att.account,
+    messageId: att.messageId,
+    filename: att.filename,
+    mimeType: att.mimeType,
+    size: att.size,
+  };
+  if (saveTo) {
+    let target = resolve(saveTo);
+    let isDir = saveTo.endsWith("/");
+    try {
+      isDir ||= statSync(target).isDirectory();
+    } catch {
+      /* doesn't exist yet: a file path unless it ends with "/" */
+    }
+    if (isDir) {
+      mkdirSync(target, { recursive: true });
+      target = join(target, safeFilename(att.filename));
+    }
+    writeFileSync(target, att.data);
+    return ok({ ...meta, savedTo: target });
+  }
+  if (att.size > MAX_INLINE_ATTACHMENT_BYTES) {
+    return fail(
+      `Attachment "${att.filename}" is ${att.size} bytes, over the 12 MB limit for returning it inline. ` +
+        "Call again with saveTo set to a local directory to save it to disk.",
+    );
+  }
+  const mime = att.mimeType.toLowerCase();
+  const header: ContentBlock = { type: "text", text: JSON.stringify(meta, null, 2) };
+  if (/^image\/(png|jpe?g|gif|webp)$/.test(mime)) {
+    return { content: [header, { type: "image", data: att.data.toString("base64"), mimeType: mime.replace("jpg", "jpeg") }] };
+  }
+  const textual =
+    mime.startsWith("text/") ||
+    /^application\/(json|xml|csv|x-yaml|yaml|javascript|ics)$/.test(mime) ||
+    /\+(xml|json)$/.test(mime);
+  if (textual) {
+    return { content: [header, { type: "text", text: att.data.toString("utf8") }] };
+  }
+  return {
+    content: [
+      header,
+      {
+        type: "resource",
+        resource: {
+          uri: `gmail-attachment://${encodeURIComponent(att.account)}/${encodeURIComponent(att.messageId)}/${encodeURIComponent(att.filename)}`,
+          mimeType: att.mimeType,
+          blob: att.data.toString("base64"),
+        },
+      },
+    ],
+  };
 }
 
 // Reusable optional `account` field, attached to every tool.
@@ -217,6 +294,8 @@ export function buildServer(): McpServer {
         "and snippet; THREAD_VIEW_SUMMARY returns only the latest message per thread; " +
         "THREAD_VIEW_IDS_ONLY returns only thread IDs (fast; good for counting or batch actions).\n\n" +
         SEARCH_SYNTAX_DOC +
+        "\n\nresultCountEstimate on the first page is exact up to 500 matching threads; past that " +
+        "it is \"500\" with resultCountIsLowerBound: true. Later pages may omit it." +
         "\n\nDrafts are excluded by default. Trash & spam are excluded unless includeTrash is true. " +
         "Gmail matches at the message level, so a thread can appear if ANY of its messages match a " +
         "negated term.",
@@ -265,8 +344,8 @@ export function buildServer(): McpServer {
         "get_draft).\n\nmessageFormat:\n" +
         FORMAT_DOC +
         "\n\nEach body is returned in a ~50KB window. If a message has bodyTruncated: true, call " +
-        "get_message with its id and bodyOffset=nextBodyOffset to read the rest. Raw attachment " +
-        "bytes are never returned.",
+        "get_message with its id and bodyOffset=nextBodyOffset to read the rest. Attachments are " +
+        "listed as metadata; use download_gmail_attachment to get a file.",
       inputSchema: {
         threadId: z.string().min(1).describe("The thread ID (e.g. from search_threads results)."),
         messageFormat: messageFormatEnum(false),
@@ -301,6 +380,49 @@ export function buildServer(): McpServer {
       ),
   );
 
+  // --- download_gmail_attachment ----------------------------------------
+  server.registerTool(
+    "download_gmail_attachment",
+    {
+      title: "Download a Gmail attachment",
+      description:
+        "Get the file of an email attachment, such as a PDF or image, to read or save it. Give the " +
+        "email's messageId plus the attachmentId and filename that get_message or get_thread listed " +
+        "for it. If the attachment can't be identified, the reply lists the email's attachments with " +
+        "a number for each; call again with attachmentIndex set to that number.\n\n" +
+        "By default the file is returned in the result (images as images, text files as text, " +
+        "anything else as an embedded resource); files over 12 MB are refused unless saved. Set " +
+        "`saveTo` to a directory (or file path) to write the file to local disk instead and get its " +
+        "path back.",
+      inputSchema: {
+        messageId: z.string().min(1).describe("The email's ID, as search_threads, get_thread or get_message gave it."),
+        attachmentId: z.string().optional().describe("The attachment's ID, as get_message or get_thread listed it."),
+        filename: z.string().optional().describe("The attachment's file name, as get_message or get_thread listed it."),
+        mimeType: z.string().optional().describe("The attachment's MIME type, as get_message or get_thread listed it."),
+        attachmentIndex: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe("The attachment's number in this tool's own list. Only needed when a reply of this tool asks for it."),
+        saveTo: z
+          .string()
+          .optional()
+          .describe(
+            "Optional local directory or file path to save the attachment to. A directory gets the " +
+              "attachment's own file name. Returns the saved path instead of the file content.",
+          ),
+        ...accountField,
+      },
+    },
+    async ({ messageId, attachmentId, filename, mimeType, attachmentIndex, saveTo, account }) =>
+      withAccount(
+        account,
+        (auth, ctx) => downloadAttachment(auth, ctx, { messageId, attachmentId, filename, mimeType, attachmentIndex }),
+        (att) => renderAttachment(att, saveTo),
+      ),
+  );
+
   // --- create_draft -------------------------------------------------------
   server.registerTool(
     "create_draft",
@@ -317,7 +439,9 @@ export function buildServer(): McpServer {
         "thread, gets In-Reply-To/References headers, inherits \"Re: <subject>\" unless you supply " +
         "a subject, and — if `to` is omitted — is addressed to the original's Reply-To/From (or, " +
         "for your own sent message, its recipients). The original message is quoted below your " +
-        "text unless quoteOriginal is false.\n\n" +
+        "text unless quoteOriginal is false. A quoted reply is always saved with an HTML part " +
+        "(Gmail-style quote block); if you only give `body`, it is converted to HTML and also kept " +
+        "as the plain-text alternative.\n\n" +
         "Set includeSignature: true to append the account's Gmail signature.\n\n" +
         "Attachments: array of { filename, mimeType, content (base64), inline? }; combined size " +
         "≤ 25MB (link larger files from Drive). To show an inline image, set inline: true and use " +
@@ -473,8 +597,14 @@ export function buildServer(): McpServer {
         "Inbox tabs are system labels: CATEGORY_PERSONAL (Primary), CATEGORY_SOCIAL, " +
         "CATEGORY_PROMOTIONS, CATEGORY_UPDATES, CATEGORY_FORUMS. A message has at most one " +
         "category: adding one moves it to that tab and removes the previous one; removing a " +
-        "category without adding another moves it to Primary.",
+        "category without adding another moves it to Primary.\n\n" +
+        "Each label includes messagesTotal, messagesUnread, threadsTotal and threadsUnread unless " +
+        "includeCounts is false.",
       inputSchema: {
+        includeCounts: z
+          .boolean()
+          .optional()
+          .describe("Fetch message/thread counts for each label (one extra API call per label). Defaults to true."),
         includeSystem: z
           .boolean()
           .optional()
@@ -490,8 +620,10 @@ export function buildServer(): McpServer {
         ...accountField,
       },
     },
-    async ({ includeSystem, pageSize, pageToken, account }) =>
-      withAccount(account, (auth, ctx) => listLabels(auth, ctx, { includeSystem, pageSize, pageToken })),
+    async ({ includeSystem, includeCounts, pageSize, pageToken, account }) =>
+      withAccount(account, (auth, ctx) =>
+        listLabels(auth, ctx, { includeSystem, includeCounts, pageSize, pageToken }),
+      ),
   );
 
   // --- create_label / update_label ---------------------------------------
