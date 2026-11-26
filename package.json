@@ -1,6 +1,6 @@
 {
   "name": "multi-gmail-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Model Context Protocol server providing Gmail access across multiple Gmail accounts. Mirrors the standard Gmail MCP connector tool interface, adding an optional `account` selector to every tool.",
   "license": "MIT",
   "type": "module",

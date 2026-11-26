@@ -12,18 +12,34 @@ This server **creates drafts only — it never sends email.**
 
 | Tool | Purpose |
 | --- | --- |
-| `search_threads` | Search threads with full Gmail query syntax; returns per-message metadata (no bodies). |
-| `get_thread` | Fetch a thread; `FULL_CONTENT` decodes the plain-text body and lists attachments. |
-| `create_draft` | Build an RFC 2822 draft (text/html/attachments/replies). Never sends. |
-| `list_drafts` | List drafts with subject/to/snippet. |
+| `search_threads` | Search threads with full Gmail query syntax. Returns threadId, messageCount, viewUrl and up to 5 recent messages (no bodies). `resultCountEstimate` is exact up to 500 threads; past that it is a minimum flagged `resultCountIsLowerBound`. `view`: MINIMAL / METADATA_ONLY / SUMMARY / IDS_ONLY. |
+| `get_thread` | Fetch every message in a thread (drafts omitted). Formats: `PLAIN_TEXT` (default), `FULL_CONTENT` (+HTML), `MINIMAL`, `METADATA_ONLY`. |
+| `get_message` | Fetch one message, incl. `RAW` MIME source; page long bodies with `bodyOffset`. |
+| `download_gmail_attachment` | Get an attachment's file (images as images, text as text, other files as an embedded resource; 12 MB inline limit), or save it to disk with `saveTo`. |
+| `create_draft` | Build a draft (text/html/attachments). Replies auto-thread, quote the original Gmail-style in HTML (plain `body` is converted), and default `to` to the sender. Optional `includeSignature`. Never sends. |
+| `list_drafts` | List drafts, optionally filtered by `query`; `DRAFT_VIEW_FULL` adds bodies. |
+| `get_draft` | Fetch one draft in any message format. |
+| `update_draft` | Edit a draft with merge semantics (omitted fields kept; attachments are replaced, not merged). |
 | `delete_draft` | Permanently delete a draft by ID (not moved to Trash). |
-| `list_labels` | List user-defined labels (id, name, colors). |
-| `create_label` | Create a label (supports `/` nesting and palette colors). |
-| `update_label` | Rename / recolor a label. |
-| `delete_label` | Delete a user label (refuses system labels). |
-| `label_message` / `unlabel_message` | Add/remove labels on a message. |
+| `list_labels` | List system + user labels (id, name, type, colors, visibility, message/thread total and unread counts). |
+| `create_label` / `update_label` / `delete_label` | Create (auto-creating parents for `A/B/C`), rename/recolor (`colorPreset`), set visibility, delete user labels. |
+| `label_message` / `unlabel_message` | Add/remove labels on a message (`SPAM` can only be removed via `unmark_*_spam`). |
+| `update_message_labels` | Add and remove message labels atomically in one call. |
 | `label_thread` / `unlabel_thread` | Add/remove labels on a whole thread. |
+| `trash_message` / `trash_thread` | Move to Trash (recoverable). |
+| `untrash_message` / `untrash_thread` | Restore from Trash (does not re-add INBOX). |
+| `mark_message_spam` / `mark_thread_spam` | Report spam (adds SPAM, removes INBOX). |
+| `unmark_message_spam` / `unmark_thread_spam` | Remove SPAM (does not re-add INBOX). |
+| `apply_sensitive_message_label` / `apply_sensitive_thread_label` | Connector-compatible TRASH/SPAM aliases. |
 | `list_accounts` | List configured accounts with email, default flag, and auth status. |
+
+Results use the connector's field names — `sender`, `toRecipients` / `ccRecipients` /
+`bccRecipients` (plain addresses), `addressDisplayNames` (`[{emailAddress, displayName}]`),
+`date` (ISO-8601 UTC), `historyId`, `plaintextBody` (`\n` line endings), `htmlBody`,
+`attachmentIds`, `attachments` — and include a `viewUrl`
+(`#all/thread-f:<id>|msg-f:<id>`) that opens the thread/message in Gmail on the web for the
+right account. Snippets are HTML-entity-decoded (the connector returns them escaped). Threads and drafts expose their
+ID as both `id` and `threadId` / `draftId`.
 
 Every tool above (including `list_accounts`) accepts an optional **`account`** parameter.
 
@@ -200,7 +216,10 @@ Once connected, natural-language requests map to tool calls like:
 - **Search the work inbox:** `search_threads` with
   `{ "query": "in:inbox is:unread newer_than:7d", "account": "work" }`
 - **Read a thread from personal:** `get_thread` with
-  `{ "threadId": "18c...", "messageFormat": "FULL_CONTENT", "account": "personal" }`
+  `{ "threadId": "18c...", "account": "personal" }`
+- **Continue a long email:** `get_message` with
+  `{ "messageId": "18c...", "bodyOffset": 51190, "account": "personal" }`
+- **Trash a conversation:** `trash_thread` with `{ "threadId": "18c...", "account": "work" }`
 - **Draft a reply from personal:** `create_draft` with
   `{ "to": ["friend@example.com"], "body": "Sounds good!", "replyToMessageId": "18c...", "account": "personal" }`
 - **Label a thread in work:** `label_thread` with
@@ -214,10 +233,11 @@ Omitting `account` uses the default account.
 ## Gmail query syntax (search_threads)
 
 Supports the full Gmail operator set, e.g. `from:`, `to:`, `cc:`, `subject:`,
-`label:<id>`, `in:(inbox|sent|trash|spam|anywhere)`, `is:(unread|starred|important)`,
+`label:<name>`, `category:`, `in:(inbox|sent|archive|snoozed|trash|spam|anywhere)`, `is:(unread|starred|important)`,
 `has:attachment`, `filename:`, `after:/before:YYYY/MM/DD`, `newer_than:7d`,
 `older_than:1y`, `larger:/smaller:`, grouping with `()`/`{}`, `OR`, and `-` to
-exclude. Use **label IDs** (from `list_labels`), not display names, with `label:`.
+exclude. `label:` takes the label's display **name** (quote names with spaces);
+label/unlabel tools take label **IDs**. `after:` is inclusive and `before:` exclusive.
 Drafts are excluded by default; set `includeTrash: true` to also search Trash/Spam.
 
 ---
@@ -226,8 +246,10 @@ Drafts are excluded by default; set `includeTrash: true` to also search Trash/Sp
 
 ```bash
 npm run build        # compile TypeScript -> dist/
-npm test             # vitest: alias resolution, MIME building, query passthrough
-node scripts/smoke.mjs   # connect over stdio; verify 14 tools + optional `account`
+npm test             # vitest: alias resolution, MIME, query building, body decoding, retry
+node scripts/live-test.mjs   # end-to-end against your real accounts (cleans up after itself)
+node scripts/edge-test.mjs [account]   # hand-built MIME edge cases via drafts (cleaned up)
+node scripts/smoke.mjs   # connect over stdio; verify all tools + optional `account`
 ```
 
 Source layout:
@@ -237,6 +259,7 @@ Source layout:
 | `src/index.ts` | MCP server, tool registry, CLI dispatcher (`auth` vs. server). |
 | `src/accounts.ts` | Config + token store, OAuth client construction, alias resolution. |
 | `src/gmail.ts` | Gmail REST wrappers, query building, body decoding, retry/error mapping. |
+| `src/content.ts` | HTML→text (keeps links), entity decoding, UTF-8-safe body paging, reply quoting. |
 | `src/auth-cli.ts` | `auth <alias>` loopback OAuth flow. |
 | `src/mime.ts` | RFC 2822 MIME construction for drafts. |
 
@@ -246,11 +269,16 @@ Source layout:
 
 - **Drafts only.** There is no send capability by design.
 - **`delete_draft` is permanent.** It removes the draft outright (not moved to Trash); it never touches sent or received messages.
-- **Bodies** over ~50KB are truncated (flagged); raw attachment bytes are never returned by `get_thread` — only metadata + `attachmentId`.
+- **Bodies** are returned in ~50KB windows, split on UTF-8 character boundaries. A truncated body has `bodyTruncated: true` and `nextBodyOffset`; pass that to `get_message` as `bodyOffset` to read the rest. Large text parts that Gmail stores out-of-line are fetched automatically.
+- **HTML-only mail** is converted to text with links kept as `[text](url)`; `FULL_CONTENT` also returns the original HTML.
+- **Attachments**: `get_message`/`get_thread` list metadata only (filename, mimeType, size, attachmentId, Content-ID); fetch the file with `download_gmail_attachment`.
+- **Inline images** in `create_draft`: reference them as `cid:attN` (N = position in `attachments`); `cid:<filename>` still works.
 - **Attachments** in `create_draft` must total ≤ 25MB; link large files from Drive instead.
-- **Rate limits / 5xx** are retried up to 3 times with exponential backoff; persistent failures return a clear error.
+- **Rate limits** (Gmail's per-user, per-minute quota) are retried up to 6 times with exponential backoff (≈1s→16s, honoring `Retry-After`); **5xx** errors up to 3 times. Persistent failures return a clear error.
+- **Attached emails** (`message/rfc822`, e.g. "forward as attachment") are listed as attachments; their text is not merged into the outer body.
 - **Auth errors** (`401` / `invalid_grant`) tell you exactly which account to re-auth.
-- **System labels** can be used directly by ID (`INBOX`, `TRASH`, `SPAM`, `STARRED`, `UNREAD`, `IMPORTANT`, `DRAFT`, `SENT`); they cannot be deleted or modified.
+- **System labels** (`INBOX`, `STARRED`, `UNREAD`, `IMPORTANT`, `CATEGORY_*`, ...) are listed by `list_labels` and usable by ID; they cannot be deleted or renamed. `DRAFT` and `SENT` are read-only.
+- **Trash vs. delete:** `trash_*` is recoverable for 30 days; only `delete_draft` deletes permanently.
 
 ## License
 

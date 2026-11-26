@@ -22,7 +22,8 @@ export interface MimeAttachment {
 }
 
 export interface MimeOptions {
-  to: string[];
+  /** Primary recipients. May be empty: Gmail allows drafts without recipients. */
+  to?: string[];
   cc?: string[];
   bcc?: string[];
   subject?: string;
@@ -82,7 +83,12 @@ function textPart(mimeType: string, text: string): string {
   return headers.join(CRLF) + CRLF + CRLF + b64;
 }
 
-function attachmentPart(att: MimeAttachment): string {
+/** Content-ID for the attachment at position `index` (matches cid:attN in HTML). */
+export function inlineContentId(index: number): string {
+  return `att${index}`;
+}
+
+function attachmentPart(att: MimeAttachment, index: number): string {
   const mimeType = att.mimeType || "application/octet-stream";
   const filename = att.filename || "attachment";
   const disposition = att.inline ? "inline" : "attachment";
@@ -92,8 +98,9 @@ function attachmentPart(att: MimeAttachment): string {
     `Content-Disposition: ${disposition}; filename="${filename}"`,
   ];
   if (att.inline) {
-    // A stable Content-ID lets HTML reference inline images via cid:<filename>.
-    headers.push(`Content-ID: <${filename}>`);
+    // HTML references inline images via cid:attN (N = position in the full
+    // attachments array). cid:<filename> references are rewritten to match.
+    headers.push(`Content-ID: <${inlineContentId(index)}>`);
   }
   // Re-chunk the provided base64 so line lengths are RFC-compliant regardless
   // of how the caller encoded it.
@@ -114,10 +121,9 @@ function multipart(subtype: string, boundary: string, parts: string[]): string {
 export function buildMimeMessage(opts: MimeOptions): string {
   const newBoundary = opts.boundaryFactory ?? defaultBoundary;
 
+  const headers: string[] = [];
   const toLine = addressList(opts.to);
-  if (!toLine) throw new Error("At least one recipient is required in `to`.");
-
-  const headers: string[] = [`To: ${toLine}`];
+  if (toLine) headers.push(`To: ${toLine}`);
   const cc = addressList(opts.cc);
   if (cc) headers.push(`Cc: ${cc}`);
   const bcc = addressList(opts.bcc);
@@ -128,7 +134,16 @@ export function buildMimeMessage(opts: MimeOptions): string {
   headers.push("MIME-Version: 1.0");
 
   const plain = opts.body ?? "";
-  const html = opts.htmlBody;
+  const attachments = opts.attachments ?? [];
+  let html = opts.htmlBody;
+  if (html) {
+    // Back-compat: let HTML reference inline images by cid:<filename> too.
+    attachments.forEach((a, i) => {
+      if (a.inline && a.filename) {
+        html = html!.split(`cid:${a.filename}`).join(`cid:${inlineContentId(i)}`);
+      }
+    });
+  }
 
   // 1) Build the "body" part (text, or alternative of text+html).
   let bodyPart: string;
@@ -145,18 +160,18 @@ export function buildMimeMessage(opts: MimeOptions): string {
   }
 
   // 2) Layer in attachments.
-  const attachments = opts.attachments ?? [];
-  const inline = attachments.filter((a) => a.inline);
-  const regular = attachments.filter((a) => !a.inline);
+  const indexed = attachments.map((a, i) => ({ a, i }));
+  const inline = indexed.filter(({ a }) => a.inline);
+  const regular = indexed.filter(({ a }) => !a.inline);
 
   let payload = bodyPart;
   if (inline.length > 0) {
     const relBoundary = newBoundary();
-    payload = multipart("related", relBoundary, [payload, ...inline.map(attachmentPart)]);
+    payload = multipart("related", relBoundary, [payload, ...inline.map(({ a, i }) => attachmentPart(a, i))]);
   }
   if (regular.length > 0) {
     const mixedBoundary = newBoundary();
-    payload = multipart("mixed", mixedBoundary, [payload, ...regular.map(attachmentPart)]);
+    payload = multipart("mixed", mixedBoundary, [payload, ...regular.map(({ a, i }) => attachmentPart(a, i))]);
   }
 
   const raw = headers.join(CRLF) + CRLF + payload;
